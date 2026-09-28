@@ -34,9 +34,12 @@ impl NdSinker for FilterSinker {
     fn try_sink(
         &self,
         parent: &Arc<dyn ExecutionPlan>,
-        child: &Arc<dyn ExecutionPlan>,
+        children: &[Arc<dyn ExecutionPlan>],
         registry: &Arc<NdNodeRegistry>,
     ) -> Result<Option<Sunk>> {
+        let [child] = children else {
+            return Ok(None);
+        };
         let Some(filter) = parent.as_any().downcast_ref::<FilterExec>() else {
             return Ok(None);
         };
@@ -112,9 +115,12 @@ impl NdSinker for ProjectionSinker {
     fn try_sink(
         &self,
         parent: &Arc<dyn ExecutionPlan>,
-        child: &Arc<dyn ExecutionPlan>,
+        children: &[Arc<dyn ExecutionPlan>],
         registry: &Arc<NdNodeRegistry>,
     ) -> Result<Option<Sunk>> {
+        let [child] = children else {
+            return Ok(None);
+        };
         let Some(projection) = parent.as_any().downcast_ref::<ProjectionExec>() else {
             return Ok(None);
         };

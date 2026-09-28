@@ -221,12 +221,12 @@ impl NdSinker for TagSinker {
     fn try_sink(
         &self,
         parent: &Arc<dyn ExecutionPlan>,
-        child: &Arc<dyn ExecutionPlan>,
+        children: &[Arc<dyn ExecutionPlan>],
         registry: &Arc<NdNodeRegistry>,
     ) -> Result<Option<Sunk>> {
-        if !parent.as_any().is::<FlatTagExec>() {
+        let (true, [child]) = (parent.as_any().is::<FlatTagExec>(), children) else {
             return Ok(None);
-        }
+        };
         let nd = NdTagExec::try_new(child.clone(), registry.clone())?;
         Ok(Some(Sunk {
             nd: Arc::new(nd),

@@ -36,7 +36,7 @@ where
 /// The result of an [`NdSinker`]: an nd node that replaces a flat node above
 /// the boundary.
 pub struct Sunk {
-    /// The nd node that goes below the boundary, over the old nd child.
+    /// The nd node that goes below the boundary, over the old nd children.
     pub nd: Arc<dyn NdExecutionPlan>,
     /// A flat node that stays above the boundary, or `None`. The boundary
     /// rule replaces its one child with the new boundary.
@@ -46,14 +46,14 @@ pub struct Sunk {
 /// The sink check of one flat node kind: can the node move below the nd
 /// boundary?
 pub trait NdSinker: Send + Sync + fmt::Debug {
-    /// Return the nd replacement of `parent` over `child`, or `None` when
+    /// Return the nd replacement of `parent` over `children`, or `None` when
     /// `parent` is not a node kind of this sinker or cannot operate on grids.
-    /// `child` is the nd child of the boundary under `parent`. Build the
-    /// replacement with `registry`.
+    /// `children` holds the nd child of the boundary under each child of
+    /// `parent`, in order. Build the replacement with `registry`.
     fn try_sink(
         &self,
         parent: &Arc<dyn ExecutionPlan>,
-        child: &Arc<dyn ExecutionPlan>,
+        children: &[Arc<dyn ExecutionPlan>],
         registry: &Arc<NdNodeRegistry>,
     ) -> Result<Option<Sunk>>;
 }

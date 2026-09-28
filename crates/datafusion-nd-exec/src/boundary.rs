@@ -22,6 +22,8 @@ use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::{ExecutionPlan, Partitioning};
 
+use nd_arrow_array::SelectionKind;
+
 use crate::exec::NdBroadcastExec;
 use crate::registry::NdNodeRegistry;
 
@@ -36,27 +38,36 @@ impl NdBoundaryRule {
         Self { registry }
     }
 
-    /// Sink `node` below the boundary under it, if a sinker accepts it.
+    /// Sink `node` below the boundaries under it, if a sinker accepts it.
+    /// Every child of `node` must be a boundary.
     fn sink(&self, node: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
-        let [child] = node.children()[..] else {
+        let mut belows: Vec<Arc<dyn ExecutionPlan>> =
+            node.children().into_iter().cloned().collect();
+        if belows.is_empty() {
             return Ok(Transformed::no(node));
-        };
-        // The round-robin repartitions between `node` and the boundary, top
-        // down.
-        let mut passthrough = Vec::new();
-        let mut below = child.clone();
-        while is_round_robin(&below) {
-            passthrough.push(below.clone());
-            below = below.children()[0].clone();
         }
-        let Some(boundary) = below.as_any().downcast_ref::<NdBroadcastExec>() else {
-            return Ok(Transformed::no(node));
-        };
-        let nd_child = boundary.input();
-        let child_selection = boundary.nd_input().max_output_selection();
+        // The round-robin repartitions between a one-child `node` and the
+        // boundary, top down.
+        let mut passthrough = Vec::new();
+        if let [below] = &mut belows[..] {
+            while is_round_robin(below) {
+                passthrough.push(below.clone());
+                let next = below.children()[0].clone();
+                *below = next;
+            }
+        }
+        let mut nd_children = Vec::with_capacity(belows.len());
+        let mut child_selection = SelectionKind::Full;
+        for below in &belows {
+            let Some(boundary) = below.as_any().downcast_ref::<NdBroadcastExec>() else {
+                return Ok(Transformed::no(node));
+            };
+            nd_children.push(boundary.input().clone());
+            child_selection = child_selection.max(boundary.nd_input().max_output_selection());
+        }
 
         for sinker in self.registry.sinkers() {
-            let Some(sunk) = sinker.try_sink(&node, nd_child, &self.registry)? else {
+            let Some(sunk) = sinker.try_sink(&node, &nd_children, &self.registry)? else {
                 continue;
             };
             // The new node must accept every selection its child can output.
