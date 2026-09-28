@@ -5,7 +5,6 @@ use std::fmt;
 use std::sync::Arc;
 
 use datafusion::common::config::ConfigOptions;
-use datafusion::common::plan_err;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::PhysicalExpr;
@@ -19,7 +18,8 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 
-use super::{as_nd_plan, materialize_nd_stream};
+use super::{NdExecutionPlan, materialize_nd_stream, require_nd_input};
+use crate::registry::NdNodeRegistry;
 
 /// Boundary between the nd pipeline and the rest of the plan: pulls nd
 /// batches from its child and emits flat, fully-broadcast `RecordBatch`es.
@@ -28,24 +28,43 @@ use super::{as_nd_plan, materialize_nd_stream};
 #[derive(Debug, Clone)]
 pub struct NdBroadcastExec {
     input: Arc<dyn ExecutionPlan>,
+    /// The nd side of `input`.
+    nd_input: Arc<dyn NdExecutionPlan>,
+    registry: Arc<NdNodeRegistry>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
 impl NdBroadcastExec {
+    /// Build a broadcast over `input`, resolved through the default registry.
     pub fn try_new(input: Arc<dyn ExecutionPlan>) -> Result<Self> {
-        if as_nd_plan(&input).is_none() {
-            return plan_err!(
-                "NdBroadcastExec requires an nd-aware input, got {}",
-                input.name()
-            );
-        }
+        Self::try_new_with_registry(input, NdNodeRegistry::shared_default())
+    }
+
+    /// Build a broadcast over `input`, resolved through `registry`.
+    pub fn try_new_with_registry(
+        input: Arc<dyn ExecutionPlan>,
+        registry: Arc<NdNodeRegistry>,
+    ) -> Result<Self> {
+        let nd_input = require_nd_input("NdBroadcastExec", &input, &registry)?;
         let properties = input.properties().clone();
         Ok(Self {
             input,
+            nd_input,
+            registry,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    /// The registry that resolves the nd child.
+    pub fn registry(&self) -> &Arc<NdNodeRegistry> {
+        &self.registry
+    }
+
+    /// The nd side of the child.
+    pub fn nd_input(&self) -> &Arc<dyn NdExecutionPlan> {
+        &self.nd_input
     }
 
     /// The nd-aware child whose batches this node materializes.
@@ -84,7 +103,10 @@ impl ExecutionPlan for NdBroadcastExec {
         let [input] = <[_; 1]>::try_from(children).map_err(|_| {
             DataFusionError::Internal("NdBroadcastExec expects exactly one child".to_string())
         })?;
-        Ok(Arc::new(Self::try_new(input)?))
+        Ok(Arc::new(Self::try_new_with_registry(
+            input,
+            self.registry.clone(),
+        )?))
     }
 
     fn execute(
@@ -92,9 +114,7 @@ impl ExecutionPlan for NdBroadcastExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let stream = as_nd_plan(&self.input)
-            .expect("validated in try_new")
-            .execute_nd(partition, context)?;
+        let stream = self.nd_input.execute_nd(partition, context)?;
         let baseline = BaselineMetrics::new(&self.metrics, partition);
         // Per-column materialization outcome: a real broadcast gather, or a
         // zero-copy pass-through of an already-full-rank column.

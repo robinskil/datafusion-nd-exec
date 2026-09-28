@@ -34,7 +34,8 @@ use nd_arrow_array::batch::NdRecordBatch;
 use nd_arrow_array::selection::Selection;
 
 use super::expr_column::{NdExprColumn, ProjectMetrics};
-use super::{NdBroadcastExec, NdExecutionPlan, SendableNdBatchStream, as_nd_plan};
+use super::{NdBroadcastExec, NdExecutionPlan, SendableNdBatchStream, require_nd_input};
+use crate::registry::NdNodeRegistry;
 
 /// Per-partition counters recorded while filtering.
 struct FilterMetrics {
@@ -55,6 +56,9 @@ struct FilterMetrics {
 pub struct NdFilterExec {
     /// nd-aware child producing the input nd batches.
     input: Arc<dyn ExecutionPlan>,
+    /// The nd side of `input`.
+    nd_input: Arc<dyn NdExecutionPlan>,
+    registry: Arc<NdNodeRegistry>,
     /// Predicate conjuncts, ANDed together (each must be boolean).
     predicates: Vec<Arc<dyn PhysicalExpr>>,
     /// Per-conjunct evaluation plan (derived from `predicates`).
@@ -72,12 +76,17 @@ impl NdFilterExec {
         input: Arc<dyn ExecutionPlan>,
         predicates: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Result<Self> {
-        if as_nd_plan(&input).is_none() {
-            return Err(DataFusionError::Plan(format!(
-                "NdFilterExec requires an nd-aware input, got {}",
-                input.name()
-            )));
-        }
+        Self::try_new_with_registry(input, predicates, NdNodeRegistry::shared_default())
+    }
+
+    /// Like [`try_new`](Self::try_new), but resolves the nd child through
+    /// `registry`.
+    pub fn try_new_with_registry(
+        input: Arc<dyn ExecutionPlan>,
+        predicates: Vec<Arc<dyn PhysicalExpr>>,
+        registry: Arc<NdNodeRegistry>,
+    ) -> Result<Self> {
+        let nd_input = require_nd_input("NdFilterExec", &input, &registry)?;
         if predicates.is_empty() {
             return Err(DataFusionError::Plan(
                 "NdFilterExec requires at least one predicate".to_string(),
@@ -94,6 +103,8 @@ impl NdFilterExec {
         let properties = input.properties().clone();
         Ok(Self {
             input,
+            nd_input,
+            registry,
             predicates,
             columns,
             properties,
@@ -194,7 +205,11 @@ impl ExecutionPlan for NdFilterExec {
         let [input] = <[_; 1]>::try_from(children).map_err(|_| {
             DataFusionError::Internal("NdFilterExec expects exactly one child".to_string())
         })?;
-        Ok(Arc::new(Self::try_new(input, self.predicates.clone())?))
+        Ok(Arc::new(Self::try_new_with_registry(
+            input,
+            self.predicates.clone(),
+            self.registry.clone(),
+        )?))
     }
 
     fn execute(
@@ -206,7 +221,8 @@ impl ExecutionPlan for NdFilterExec {
         // stream from `execute_nd`; a standalone execution wraps this node in an
         // `NdBroadcastExec` to materialize. In a real plan an `NdBroadcastExec`
         // sits above and pulls `execute_nd` directly, so this path is unused.
-        NdBroadcastExec::try_new(Arc::new(self.clone()))?.execute(partition, context)
+        NdBroadcastExec::try_new_with_registry(Arc::new(self.clone()), self.registry.clone())?
+            .execute(partition, context)
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -234,8 +250,8 @@ impl NdExecutionPlan for NdFilterExec {
             },
         };
         let this = self.clone();
-        let stream = as_nd_plan(&self.input)
-            .expect("validated in try_new")
+        let stream = self
+            .nd_input
             .execute_nd(partition, context)?
             .map(move |item| {
                 let _timer = baseline.elapsed_compute().timer();

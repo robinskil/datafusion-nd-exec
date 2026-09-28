@@ -2,8 +2,8 @@
 //!
 //! DataFusion streams only flat `RecordBatch`es between generic operators, so
 //! nd-aware operators exchange [`NdRecordBatch`]es through a side channel: the
-//! [`NdExecutionPlan`] trait's `execute_nd`. [`as_nd_plan`] recovers that trait
-//! from an `Arc<dyn ExecutionPlan>` child. Every nd operator's standard
+//! [`NdExecutionPlan`] trait's `execute_nd`. The [`NdNodeRegistry`] recovers
+//! that trait from an `Arc<dyn ExecutionPlan>` child. Every nd operator's standard
 //! `execute` still yields flat batches (by materializing), so any nd node is
 //! also a correct plan on its own.
 
@@ -16,7 +16,7 @@ mod source_exec;
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
-use datafusion::error::Result;
+use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::filter_pushdown::{
@@ -29,6 +29,8 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 
 use nd_arrow_array::NdRecordBatch;
+
+use crate::registry::NdNodeRegistry;
 
 pub use broadcast_exec::NdBroadcastExec;
 pub use filter_exec::NdFilterExec;
@@ -81,20 +83,19 @@ pub trait NdExecutionPlan: ExecutionPlan {
     ) -> Result<SendableNdBatchStream>;
 }
 
-/// Recover the nd side channel from a plan node. Extend this list when a new
-/// nd-aware operator is added.
-pub fn as_nd_plan(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn NdExecutionPlan>> {
-    let any = plan.as_any();
-    if let Some(source) = any.downcast_ref::<NdSourceExec>() {
-        return Some(Arc::new(source.clone()));
-    }
-    if let Some(projection) = any.downcast_ref::<NdProjectionExec>() {
-        return Some(Arc::new(projection.clone()));
-    }
-    if let Some(filter) = any.downcast_ref::<NdFilterExec>() {
-        return Some(Arc::new(filter.clone()));
-    }
-    None
+/// Resolve the nd side of `input` through `registry`, or fail with a plan
+/// error that names `node`.
+pub(crate) fn require_nd_input(
+    node: &str,
+    input: &Arc<dyn ExecutionPlan>,
+    registry: &NdNodeRegistry,
+) -> Result<Arc<dyn NdExecutionPlan>> {
+    registry.as_nd_plan(input).ok_or_else(|| {
+        DataFusionError::Plan(format!(
+            "{node} requires an nd-aware input, got {}",
+            input.name()
+        ))
+    })
 }
 
 /// Adapt an nd batch stream into a standard record batch stream, dropping
@@ -195,23 +196,27 @@ mod tests {
     }
 
     #[test]
-    fn as_nd_plan_recognizes_only_nd_aware_nodes() {
+    fn the_registry_recognizes_only_nd_aware_nodes() {
+        let registry = NdNodeRegistry::new();
         let source = source(&[("time", 2)]);
         let plan: Arc<dyn ExecutionPlan> = source.clone();
-        assert!(as_nd_plan(&plan).is_some());
+        assert!(registry.as_nd_plan(&plan).is_some());
 
         let projection: Arc<dyn ExecutionPlan> =
             Arc::new(NdProjectionExec::try_new(plan.clone(), vec![]).unwrap());
-        assert!(as_nd_plan(&projection).is_some());
+        assert!(registry.as_nd_plan(&projection).is_some());
 
         // The broadcast is the terminal node: it flattens, so it is *not* an nd
         // producer and must not be treated as one.
         let broadcast: Arc<dyn ExecutionPlan> =
             Arc::new(NdBroadcastExec::try_new(plan.clone()).unwrap());
-        assert!(as_nd_plan(&broadcast).is_none());
+        assert!(registry.as_nd_plan(&broadcast).is_none());
 
         // …and neither is the underlying flat child.
-        assert!(as_nd_plan(source.input()).is_none());
+        assert!(registry.as_nd_plan(source.input()).is_none());
+
+        // An empty registry knows no node.
+        assert!(NdNodeRegistry::empty().as_nd_plan(&plan).is_none());
     }
 
     /// An empty grid carries no rows, so the materializing adapter must drop the

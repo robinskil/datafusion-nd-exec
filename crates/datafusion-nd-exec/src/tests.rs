@@ -75,12 +75,7 @@ fn test_source() -> Arc<NdSourceExec> {
 
     let encoded_schema = encoded[0].schema();
     // One partition, each nd chunk its own single-row encoded batch.
-    let source = MemorySourceConfig::try_new_exec(
-        &[encoded],
-        encoded_schema,
-        None,
-    )
-    .unwrap();
+    let source = MemorySourceConfig::try_new_exec(&[encoded], encoded_schema, None).unwrap();
     Arc::new(NdSourceExec::try_new(source).unwrap())
 }
 

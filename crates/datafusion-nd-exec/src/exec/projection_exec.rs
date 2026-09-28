@@ -33,7 +33,8 @@ use futures::StreamExt;
 use nd_arrow_array::batch::NdRecordBatch;
 
 use super::expr_column::{NdExprColumn, ProjectMetrics};
-use super::{NdBroadcastExec, NdExecutionPlan, SendableNdBatchStream, as_nd_plan};
+use super::{NdBroadcastExec, NdExecutionPlan, SendableNdBatchStream, require_nd_input};
+use crate::registry::NdNodeRegistry;
 
 /// Projects a list of element-wise expressions over un-broadcast nd batches,
 /// evaluating each on its footprint sub-grid. Requires an nd-aware child and is
@@ -43,6 +44,9 @@ use super::{NdBroadcastExec, NdExecutionPlan, SendableNdBatchStream, as_nd_plan}
 pub struct NdProjectionExec {
     /// nd-aware child producing the input nd batches.
     input: Arc<dyn ExecutionPlan>,
+    /// The nd side of `input`.
+    nd_input: Arc<dyn NdExecutionPlan>,
+    registry: Arc<NdNodeRegistry>,
     /// Output expressions with their aliases, as given (drives display and
     /// `with_new_children`).
     exprs: Vec<(Arc<dyn PhysicalExpr>, String)>,
@@ -74,12 +78,23 @@ impl NdProjectionExec {
         exprs: Vec<(Arc<dyn PhysicalExpr>, String)>,
         output_schema: Option<SchemaRef>,
     ) -> Result<Self> {
-        if as_nd_plan(&input).is_none() {
-            return Err(DataFusionError::Plan(format!(
-                "NdProjectionExec requires an nd-aware input, got {}",
-                input.name()
-            )));
-        }
+        Self::try_new_with_registry(
+            input,
+            exprs,
+            output_schema,
+            NdNodeRegistry::shared_default(),
+        )
+    }
+
+    /// Like [`try_new_with_schema`](Self::try_new_with_schema), but resolves
+    /// the nd child through `registry`.
+    pub fn try_new_with_registry(
+        input: Arc<dyn ExecutionPlan>,
+        exprs: Vec<(Arc<dyn PhysicalExpr>, String)>,
+        output_schema: Option<SchemaRef>,
+        registry: Arc<NdNodeRegistry>,
+    ) -> Result<Self> {
+        let nd_input = require_nd_input("NdProjectionExec", &input, &registry)?;
         let input_schema = input.schema();
 
         let mut fields = Vec::with_capacity(exprs.len());
@@ -123,6 +138,8 @@ impl NdProjectionExec {
         );
         Ok(Self {
             input,
+            nd_input,
+            registry,
             exprs,
             columns,
             schema,
@@ -196,7 +213,12 @@ impl ExecutionPlan for NdProjectionExec {
         let [input] = <[_; 1]>::try_from(children).map_err(|_| {
             DataFusionError::Internal("NdProjectionExec expects exactly one child".to_string())
         })?;
-        Ok(Arc::new(Self::try_new(input, self.exprs.clone())?))
+        Ok(Arc::new(Self::try_new_with_registry(
+            input,
+            self.exprs.clone(),
+            Some(self.schema.clone()),
+            self.registry.clone(),
+        )?))
     }
 
     fn execute(
@@ -215,7 +237,8 @@ impl ExecutionPlan for NdProjectionExec {
         // an `NdBroadcastExec` sits at the top and pulls this node's `execute_nd`
         // directly (through any nd operators in between), so this path is never
         // taken — the broadcast stays a separate, single terminal node.
-        NdBroadcastExec::try_new(Arc::new(self.clone()))?.execute(partition, context)
+        NdBroadcastExec::try_new_with_registry(Arc::new(self.clone()), self.registry.clone())?
+            .execute(partition, context)
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -237,8 +260,8 @@ impl NdExecutionPlan for NdProjectionExec {
             broadcasts: MetricBuilder::new(&self.metrics).counter("implicit_broadcasts", partition),
         };
         let this = self.clone();
-        let stream = as_nd_plan(&self.input)
-            .expect("validated in try_new")
+        let stream = self
+            .nd_input
             .execute_nd(partition, context)?
             .map(move |item| {
                 let _timer = baseline.elapsed_compute().timer();
