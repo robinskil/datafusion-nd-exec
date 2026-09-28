@@ -5,6 +5,7 @@ use std::sync::Arc;
 use datafusion::error::Result;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{PhysicalExpr, conjunction, split_conjunction};
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::filter::{FilterExec, FilterExecBuilder};
 use datafusion::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion::physical_plan::projection::ProjectionExec;
@@ -13,7 +14,8 @@ use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, Partitioning};
 
 use crate::exec::{
-    NdExecutionPlan, NdFilterExec, NdLimitExec, NdProjectionExec, NdRepartitionExec, NdUnionExec,
+    NdCoalescePartitionsExec, NdExecutionPlan, NdFilterExec, NdLimitExec, NdProjectionExec,
+    NdRepartitionExec, NdUnionExec,
 };
 use crate::optimizer::is_pushable_expr;
 use crate::registry::{NdNodeRegistry, NdSinker, Sunk};
@@ -93,7 +95,7 @@ impl NdSinker for FilterSinker {
                     registry.clone(),
                 )?),
             };
-            return Ok(Some(Sunk { nd, residual: None }));
+            return Ok(Some(Sunk::Below { nd, residual: None }));
         }
 
         // The residual keeps the old input as a placeholder: the boundary rule
@@ -103,7 +105,7 @@ impl NdSinker for FilterSinker {
             .with_default_selectivity(filter.default_selectivity())
             .with_fetch(filter.fetch())
             .build()?;
-        Ok(Some(Sunk {
+        Ok(Some(Sunk::Below {
             nd: nd_filter,
             residual: Some(Arc::new(residual)),
         }))
@@ -153,7 +155,7 @@ impl NdSinker for ProjectionSinker {
             Some(projection.schema()),
             registry.clone(),
         )?;
-        Ok(Some(Sunk {
+        Ok(Some(Sunk::Below {
             nd: Arc::new(nd),
             residual: None,
         }))
@@ -191,7 +193,7 @@ impl NdSinker for UnionSinker {
             return Ok(None);
         }
         let nd = NdUnionExec::try_new_with_registry(children.to_vec(), registry.clone())?;
-        Ok(Some(Sunk {
+        Ok(Some(Sunk::Below {
             nd: Arc::new(nd),
             residual: None,
         }))
@@ -232,7 +234,7 @@ impl NdSinker for LimitSinker {
             return Ok(None);
         };
         let nd = NdLimitExec::try_new_with_registry(child.clone(), skip, fetch, registry.clone())?;
-        Ok(Some(Sunk {
+        Ok(Some(Sunk::Below {
             nd: Arc::new(nd),
             residual: None,
         }))
@@ -272,9 +274,49 @@ impl NdSinker for RepartitionSinker {
         }
         let nd =
             NdRepartitionExec::try_new_with_registry(child.clone(), *partitions, registry.clone())?;
-        Ok(Some(Sunk {
+        Ok(Some(Sunk::Below {
             nd: Arc::new(nd),
             residual: None,
         }))
+    }
+}
+
+/// Sinks a `CoalescePartitionsExec` into an [`NdCoalescePartitionsExec`]. A
+/// `fetch` on it becomes an [`NdLimitExec`] on top.
+///
+/// ```text
+/// CoalescePartitionsExec             NdBroadcastExec
+///   NdBroadcastExec           ->       NdCoalescePartitionsExec
+///     nd-child                           nd-child
+/// ```
+#[derive(Debug, Default)]
+pub struct CoalesceSinker;
+
+impl NdSinker for CoalesceSinker {
+    fn try_sink(
+        &self,
+        parent: &Arc<dyn ExecutionPlan>,
+        children: &[Arc<dyn ExecutionPlan>],
+        registry: &Arc<NdNodeRegistry>,
+    ) -> Result<Option<Sunk>> {
+        let [child] = children else {
+            return Ok(None);
+        };
+        let Some(coalesce) = parent.as_any().downcast_ref::<CoalescePartitionsExec>() else {
+            return Ok(None);
+        };
+        let merged: Arc<dyn NdExecutionPlan> = Arc::new(
+            NdCoalescePartitionsExec::try_new_with_registry(child.clone(), registry.clone())?,
+        );
+        let nd: Arc<dyn NdExecutionPlan> = match coalesce.fetch() {
+            None => merged,
+            Some(fetch) => Arc::new(NdLimitExec::try_new_with_registry(
+                merged,
+                0,
+                Some(fetch),
+                registry.clone(),
+            )?),
+        };
+        Ok(Some(Sunk::Below { nd, residual: None }))
     }
 }

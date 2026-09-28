@@ -228,7 +228,7 @@ impl NdSinker for TagSinker {
             return Ok(None);
         };
         let nd = NdTagExec::try_new(child.clone(), registry.clone())?;
-        Ok(Some(Sunk {
+        Ok(Some(Sunk::Below {
             nd: Arc::new(nd),
             residual: None,
         }))

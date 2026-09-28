@@ -14,10 +14,12 @@ use datafusion::execution::config::SessionConfig;
 use datafusion::physical_plan::ExecutionPlan;
 
 use crate::exec::{
-    NdAxisReorderExec, NdEmptyExec, NdExecutionPlan, NdFilterExec, NdLimitExec, NdProjectionExec,
-    NdRepartitionExec, NdSourceExec, NdUnionExec,
+    NdAxisReorderExec, NdCoalescePartitionsExec, NdEmptyExec, NdExecutionPlan, NdFilterExec,
+    NdLimitExec, NdProjectionExec, NdRepartitionExec, NdSourceExec, NdUnionExec,
 };
-use crate::sinkers::{FilterSinker, LimitSinker, ProjectionSinker, RepartitionSinker, UnionSinker};
+use crate::sinkers::{
+    CoalesceSinker, FilterSinker, LimitSinker, ProjectionSinker, RepartitionSinker, UnionSinker,
+};
 
 /// Recognizes the nd node types of one crate. Returns `None` for any other
 /// node.
@@ -36,14 +38,19 @@ where
     })
 }
 
-/// The result of an [`NdSinker`]: an nd node that replaces a flat node above
-/// the boundary.
-pub struct Sunk {
-    /// The nd node that goes below the boundary, over the old nd children.
-    pub nd: Arc<dyn NdExecutionPlan>,
-    /// A flat node that stays above the boundary, or `None`. The boundary
-    /// rule replaces its one child with the new boundary.
-    pub residual: Option<Arc<dyn ExecutionPlan>>,
+/// The result of an [`NdSinker`].
+pub enum Sunk {
+    /// An nd node that replaces a flat node above the boundary.
+    Below {
+        /// The nd node that goes below the boundary, over the old nd children.
+        nd: Arc<dyn NdExecutionPlan>,
+        /// A flat node that stays above the boundary, or `None`. The boundary
+        /// rule replaces its one child with the new boundary.
+        residual: Option<Arc<dyn ExecutionPlan>>,
+    },
+    /// A terminal node that replaces the flat node and the boundary under it.
+    /// It reads nd batches and yields flat output, for example a row count.
+    Terminal(Arc<dyn ExecutionPlan>),
 }
 
 /// The sink check of one flat node kind: can the node move below the nd
@@ -80,11 +87,13 @@ impl NdNodeRegistry {
             .with_probe(probe_for::<NdRepartitionExec>())
             .with_probe(probe_for::<NdEmptyExec>())
             .with_probe(probe_for::<NdAxisReorderExec>())
+            .with_probe(probe_for::<NdCoalescePartitionsExec>())
             .with_sinker(Arc::new(FilterSinker))
             .with_sinker(Arc::new(ProjectionSinker))
             .with_sinker(Arc::new(UnionSinker))
             .with_sinker(Arc::new(LimitSinker))
             .with_sinker(Arc::new(RepartitionSinker))
+            .with_sinker(Arc::new(CoalesceSinker))
     }
 
     /// A registry with no probes and no sinkers.

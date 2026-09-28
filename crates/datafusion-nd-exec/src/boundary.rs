@@ -8,7 +8,9 @@
 //! stops there.
 //!
 //! A round-robin `RepartitionExec` above a boundary sinks as an
-//! `NdRepartitionExec`, so the nodes above it see the boundary next.
+//! `NdRepartitionExec`, so the nodes above it see the boundary next. A
+//! terminal node, such as a sink, replaces the boundary: the nd region then
+//! ends in that node.
 //!
 //! [`NdSinker`]: crate::registry::NdSinker
 
@@ -23,7 +25,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use nd_arrow_array::SelectionKind;
 
 use crate::exec::NdBroadcastExec;
-use crate::registry::NdNodeRegistry;
+use crate::registry::{NdNodeRegistry, Sunk};
 
 /// Moves nodes that operate on grids below the nd boundary.
 #[derive(Debug)]
@@ -57,14 +59,18 @@ impl NdBoundaryRule {
             let Some(sunk) = sinker.try_sink(&node, &nd_children, &self.registry)? else {
                 continue;
             };
+            let (nd, residual) = match sunk {
+                Sunk::Terminal(terminal) => return Ok(Transformed::yes(terminal)),
+                Sunk::Below { nd, residual } => (nd, residual),
+            };
             // The new node must accept every selection its child can output.
-            if child_selection > sunk.nd.accepts_selection() {
+            if child_selection > nd.accepts_selection() {
                 continue;
             }
             let mut rebuilt: Arc<dyn ExecutionPlan> = Arc::new(
-                NdBroadcastExec::try_new_with_registry(sunk.nd, self.registry.clone())?,
+                NdBroadcastExec::try_new_with_registry(nd, self.registry.clone())?,
             );
-            if let Some(residual) = sunk.residual {
+            if let Some(residual) = residual {
                 rebuilt = residual.with_new_children(vec![rebuilt])?;
             }
             return Ok(Transformed::yes(rebuilt));

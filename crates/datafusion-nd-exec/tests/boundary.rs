@@ -12,7 +12,7 @@ use datafusion::physical_expr::{PhysicalExpr, ScalarFunctionExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::filter::{FilterExec, FilterExecBuilder};
 use datafusion::physical_plan::projection::{ProjectionExec, ProjectionExpr};
-use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, collect, displayable};
 use datafusion_nd_exec::testing::{Differential, grid_table, profile_table, sorted_rows};
 use datafusion_nd_exec::{NdBoundaryRule, NdNodeRegistry};
 
@@ -316,6 +316,34 @@ async fn a_round_robin_repartition_runs_below_the_broadcast() -> Result<()> {
             .any(|l| l.trim_start().starts_with("RepartitionExec")),
         "no RepartitionExec may stay above the broadcast:\n{plan}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_partition_merge_runs_below_the_broadcast() -> Result<()> {
+    use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+
+    for fetch in [None, Some(5)] {
+        let scan = scan()?;
+        let coalesce: Arc<dyn ExecutionPlan> =
+            Arc::new(CoalescePartitionsExec::new(scan).with_fetch(fetch));
+        let expected = collect(coalesce.clone(), Arc::new(TaskContext::default())).await?;
+        let optimized = optimize(coalesce)?;
+        let names = node_names(&optimized);
+        assert_eq!(names[0], "NdBroadcastExec");
+        assert!(
+            names.contains(&"NdCoalescePartitionsExec".to_string()),
+            "{names:?}"
+        );
+        assert_eq!(optimized.output_partitioning().partition_count(), 1);
+        let actual = collect(optimized, Arc::new(TaskContext::default())).await?;
+        let rows =
+            |b: &[arrow::record_batch::RecordBatch]| b.iter().map(|b| b.num_rows()).sum::<usize>();
+        assert_eq!(rows(&actual), rows(&expected));
+        if fetch.is_none() {
+            assert_eq!(sorted_rows(&actual)?, sorted_rows(&expected)?);
+        }
+    }
     Ok(())
 }
 

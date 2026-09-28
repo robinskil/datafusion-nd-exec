@@ -9,6 +9,7 @@
 
 mod axis_reorder_exec;
 mod broadcast_exec;
+mod coalesce_exec;
 mod empty_exec;
 mod expr_column;
 mod filter_exec;
@@ -39,6 +40,9 @@ use crate::registry::NdNodeRegistry;
 
 pub use axis_reorder_exec::NdAxisReorderExec;
 pub use broadcast_exec::NdBroadcastExec;
+pub use coalesce_exec::NdCoalescePartitionsExec;
+#[allow(unused_imports)]
+pub(crate) use coalesce_exec::merge_partitions;
 pub use empty_exec::NdEmptyExec;
 pub use filter_exec::NdFilterExec;
 pub use limit_exec::NdLimitExec;
