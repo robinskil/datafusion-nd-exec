@@ -83,3 +83,12 @@ Per batch, `NdFilterExec` routes each conjunct by its footprint:
 9. Axis ranges (#449).
 
 Each step is one commit with its tests. Verification per step: `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test --workspace --all-features`.
+
+## Changes during implementation
+
+- Step 2 kept the look-through of round-robin repartitions until step 6. Without it, the plan tests failed before `NdRepartitionExec` existed.
+- DataFusion folds a limit into `FilterExec` as a `fetch`. The filter sinker now sinks such a filter with an `NdLimitExec` on top, instead of refusing it.
+- Nd nodes return `false` from `maintains_input_order`. With `true`, `EnforceSorting` pushed a `SortExec` below them onto the nd batches or the encoded chunks. The order still reaches DataFusion through the equivalence properties.
+- `NdArrayMetadata` records the axis names of each column in `dims`, when the format knows them. `plan_target_axes` derives the plan-time grid from them.
+- `NdSourceExec` reports one ordering, with the SQL default null placement. DataFusion does not accept two orderings that differ only in null placement.
+- A filter adds a round-robin repartition, which loses the order. So `WHERE ... ORDER BY time` still sorts, on the flat path too.

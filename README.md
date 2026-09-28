@@ -8,7 +8,7 @@ Grid-native DataFusion execution for n-dimensional data. The work follows
 | Crate | Content | Depends on |
 |---|---|---|
 | `nd-arrow-array` | `NdArrowArray`, `NdRecordBatch`, `Dimensions` with axis metadata, the `Selection` lattice, `BroadcastMap`, and the `nd.array` Arrow extension type | `arrow` |
-| `datafusion-nd-exec` | The nd plan nodes, the node registry, the `NdBoundaryRule`, and a differential test harness (feature `test-utils`) | `nd-arrow-array`, `datafusion` |
+| `datafusion-nd-exec` | The nd plan nodes, the node registry, the `NdBoundaryRule`, axis ranges for readers, and a differential test harness (feature `test-utils`) | `nd-arrow-array`, `datafusion` |
 
 ## Use
 
@@ -30,6 +30,19 @@ A format that produces nd data plans its scan as
 `NdBroadcastExec(NdSourceExec(scan))`, with the scan columns encoded as
 `nd.array`. A crate adds its own nd nodes with `NdNodeRegistry::with_probe`
 and `NdNodeRegistry::with_sinker`.
+
+## Plan nodes
+
+| Node | Sinks from |
+|---|---|
+| `NdSourceExec` | the scan of a format |
+| `NdFilterExec` | `FilterExec` |
+| `NdProjectionExec` | `ProjectionExec` |
+| `NdUnionExec` | `UnionExec` |
+| `NdLimitExec` | `LocalLimitExec`, `GlobalLimitExec` |
+| `NdRepartitionExec` | round-robin `RepartitionExec` |
+| `NdEmptyExec`, `NdAxisReorderExec` | none: building blocks for sinks |
+| `NdBroadcastExec` | the boundary to flat rows |
 
 ## Test
 
