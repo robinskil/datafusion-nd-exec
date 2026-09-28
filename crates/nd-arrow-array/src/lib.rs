@@ -14,6 +14,7 @@ pub mod dimensions;
 pub mod encoding;
 pub mod error;
 pub mod extension;
+pub mod selection;
 
 pub use array::NdArrowArray;
 pub use axis::{AxisMeta, AxisOrder};
@@ -22,3 +23,4 @@ pub use broadcast::BroadcastMap;
 pub use dimensions::{Dimension, Dimensions};
 pub use error::{ArrowError, Result};
 pub use extension::{NdArrayMetadata, NdArrayType};
+pub use selection::{Selection, SelectionKind};

@@ -3,12 +3,13 @@
 
 use crate::error::Result;
 use crate::error::nd_err;
-use arrow::array::{Array, ArrayRef, RecordBatchOptions, UInt64Array};
+use arrow::array::{ArrayRef, RecordBatchOptions};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
 use super::array::NdArrowArray;
 use super::dimensions::Dimensions;
+use super::selection::Selection;
 
 /// A record batch whose columns are [`NdArrowArray`]s over a shared target
 /// grid. Each column may live on a subset of the target's dimensions (a scalar
@@ -16,19 +17,17 @@ use super::dimensions::Dimensions;
 /// un-broadcast until [`NdRecordBatch::materialize`], which broadcasts each one
 /// onto the full target grid.
 ///
-/// An optional [`selection`](Self::selection) restricts the batch to a subset of
-/// the target cells (their row-major linear indices). It is how an
-/// `NdFilterExec` records a predicate without
-/// moving data: the columns are untouched, and materialization gathers only the
-/// retained cells — the broadcast and the selection fuse into one gather per
-/// column, so the filtered-out cross-product never exists.
+/// A [`Selection`] restricts the batch to a subset of the target cells. It is
+/// how an `NdFilterExec` records a predicate without moving data: the columns
+/// are untouched, and materialization gathers only the retained cells. The
+/// broadcast and the selection fuse into one gather per column, so the
+/// filtered-out cross-product never exists.
 #[derive(Debug, Clone)]
 pub struct NdRecordBatch {
     schema: SchemaRef,
     columns: Vec<NdArrowArray>,
     target: Dimensions,
-    /// Retained target-cell indices (row-major), or `None` for the full grid.
-    selection: Option<UInt64Array>,
+    selection: Selection,
 }
 
 impl NdRecordBatch {
@@ -61,27 +60,14 @@ impl NdRecordBatch {
             schema,
             columns,
             target,
-            selection: None,
+            selection: Selection::Full,
         })
     }
 
-    /// Attach (or clear) a selection restricting the batch to a subset of target
-    /// cells, given as their row-major linear indices. Consumes and returns the
-    /// batch. Indices are validated to fall within the target grid.
-    pub fn with_selection(mut self, selection: Option<UInt64Array>) -> Result<Self> {
-        if let Some(sel) = &selection {
-            let n = self.target.num_elements() as u64;
-            if sel.null_count() > 0 {
-                return nd_err!("nd selection must not contain null indices");
-            }
-            if let Some(&max) = sel.values().iter().max() {
-                if max >= n {
-                    return nd_err!(
-                        "nd selection index {max} is out of bounds for target grid of {n} cells"
-                    );
-                }
-            }
-        }
+    /// Replace the selection of the batch. The selection is validated against
+    /// the target grid.
+    pub fn with_selection(mut self, selection: Selection) -> Result<Self> {
+        selection.validate(&self.target)?;
         self.selection = selection;
         Ok(self)
     }
@@ -102,18 +88,18 @@ impl NdRecordBatch {
         &self.target
     }
 
-    /// The retained target-cell indices, or `None` when the full grid is kept.
-    pub fn selection(&self) -> Option<&UInt64Array> {
-        self.selection.as_ref()
+    pub fn selection(&self) -> &Selection {
+        &self.selection
     }
 
-    /// Rows in the materialized batch: the selection size when filtered, else
-    /// the full broadcast grid.
+    /// True when the retained cells form a rectangle of the target grid.
+    pub fn is_rectangle(&self) -> bool {
+        self.selection.is_rectangle()
+    }
+
+    /// Rows in the materialized batch: the number of retained cells.
     pub fn num_rows(&self) -> usize {
-        match &self.selection {
-            Some(sel) => sel.len(),
-            None => self.target.num_elements(),
-        }
+        self.selection.num_rows(&self.target)
     }
 
     /// Materialize into a flat Arrow [`RecordBatch`] by broadcasting each
@@ -144,10 +130,10 @@ impl NdRecordBatch {
                     broadcasts += 1;
                 }
                 match &self.selection {
+                    Selection::Full => column.materialize_with_map(&map),
                     // Broadcast and selection fuse into one gather: source
                     // offsets for exactly the retained target cells.
-                    Some(sel) => column.take_indices(&map.gather_indices_at(sel)),
-                    None => column.materialize_with_map(&map),
+                    selection => column.take_indices(&map.gather_indices_for(selection)),
                 }
             })
             .collect::<Result<_>>()?;
@@ -228,7 +214,7 @@ mod tests {
     fn materialize_with_selection_gathers_retained_cells() {
         // Keep target cells 1, 3, 5 of the (time=2, lat=3) grid.
         let batch = test_batch()
-            .with_selection(Some(UInt64Array::from(vec![1u64, 3, 5])))
+            .with_selection(Selection::CellMask(UInt64Array::from(vec![1u64, 3, 5])))
             .unwrap();
         assert_eq!(batch.num_rows(), 3);
 
@@ -251,9 +237,53 @@ mod tests {
     }
 
     #[test]
+    fn an_axis_selection_is_a_rectangle() {
+        // Keep lat 1 and 2 for both time steps.
+        let batch = test_batch()
+            .with_selection(Selection::AxisIndices(vec![
+                None,
+                Some(UInt64Array::from(vec![1u64, 2])),
+            ]))
+            .unwrap();
+        assert!(batch.is_rectangle());
+        assert_eq!(batch.num_rows(), 4);
+
+        let out = batch.materialize().unwrap();
+        assert_eq!(
+            out.column(0).as_primitive::<Int32Type>().values(),
+            &[7, 7, 8, 8]
+        );
+        assert_eq!(
+            out.column(1).as_primitive::<Int32Type>().values(),
+            &[20, 30, 20, 30]
+        );
+        assert_eq!(
+            out.column(2).as_primitive::<Float64Type>().values(),
+            &[0.1, 0.2, 1.1, 1.2]
+        );
+    }
+
+    #[test]
+    fn a_ragged_selection_keeps_a_prefix_per_outer_cell() {
+        // One lat value for the first time step, three for the second.
+        let batch = test_batch()
+            .with_selection(Selection::Ragged {
+                lengths: UInt64Array::from(vec![1u64, 3]),
+            })
+            .unwrap();
+        assert!(!batch.is_rectangle());
+        let out = batch.materialize().unwrap();
+        assert_eq!(
+            out.column(2).as_primitive::<Float64Type>().values(),
+            &[0.0, 1.0, 1.1, 1.2]
+        );
+    }
+
+    #[test]
     fn out_of_bounds_selection_rejected() {
         // Grid has 6 cells; index 6 is out of range.
-        let result = test_batch().with_selection(Some(UInt64Array::from(vec![0u64, 6])));
+        let result =
+            test_batch().with_selection(Selection::CellMask(UInt64Array::from(vec![0u64, 6])));
         assert!(result.is_err());
     }
 

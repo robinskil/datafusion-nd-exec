@@ -12,6 +12,7 @@ use crate::error::nd_err;
 use arrow::array::UInt64Array;
 
 use super::dimensions::Dimensions;
+use super::selection::{Selection, cartesian_sum};
 
 /// Broadcast of a source dimension set onto a target dimension set,
 /// represented as one source stride per target axis.
@@ -121,39 +122,53 @@ impl BroadcastMap {
 
     /// Take indices for the broadcast view, in row-major target order.
     pub fn gather_indices(&self) -> UInt64Array {
-        let rank = self.target_shape.len();
-        // Per-axis list of precomputed source offsets (coordinate * stride).
-        let axis_offsets: Vec<Vec<u64>> = (0..rank)
+        UInt64Array::from(cartesian_sum(&self.axis_offsets(None)))
+    }
+
+    /// Source take-indices for the target cells that `selection` keeps, in
+    /// row-major target order. `selection` must be valid for the target grid.
+    ///
+    /// An [`Selection::AxisIndices`] selection fuses into the stride walk: the
+    /// gather visits only the kept coordinates of each axis. A
+    /// [`Selection::Ragged`] selection walks the outer cells and the kept
+    /// prefix of the innermost axis. A [`Selection::CellMask`] selection
+    /// decodes each kept cell.
+    pub fn gather_indices_for(&self, selection: &Selection) -> UInt64Array {
+        match selection {
+            Selection::Full => self.gather_indices(),
+            Selection::AxisIndices(axes) => {
+                debug_assert_eq!(axes.len(), self.target_shape.len());
+                UInt64Array::from(cartesian_sum(&self.axis_offsets(Some(axes))))
+            }
+            Selection::Ragged { lengths } => {
+                let rank = self.target_shape.len();
+                debug_assert!(rank > 0);
+                let mut outer = self.axis_offsets(None);
+                outer.pop();
+                let inner_stride = self.strides[rank - 1] as u64;
+                let mut out = Vec::with_capacity(lengths.values().iter().sum::<u64>() as usize);
+                for (base, &len) in cartesian_sum(&outer).into_iter().zip(lengths.values()) {
+                    out.extend((0..len).map(|c| base + c * inner_stride));
+                }
+                UInt64Array::from(out)
+            }
+            Selection::CellMask(cells) => self.gather_indices_at(cells),
+        }
+    }
+
+    /// Per target axis, the source offset of each kept coordinate.
+    fn axis_offsets(&self, axes: Option<&[Option<UInt64Array>]>) -> Vec<Vec<u64>> {
+        (0..self.target_shape.len())
             .map(|axis| {
                 let stride = self.strides[axis] as u64;
-                (0..self.target_shape[axis] as u64)
-                    .map(|c| c * stride)
-                    .collect()
+                match axes.and_then(|axes| axes[axis].as_ref()) {
+                    Some(indices) => indices.values().iter().map(|&c| c * stride).collect(),
+                    None => (0..self.target_shape[axis] as u64)
+                        .map(|c| c * stride)
+                        .collect(),
+                }
             })
-            .collect();
-
-        let total: usize = axis_offsets.iter().map(|offsets| offsets.len()).product();
-        let mut out = Vec::with_capacity(total);
-        if total > 0 {
-            fill_indices(&axis_offsets, 0, 0, &mut out);
-        }
-        UInt64Array::from(out)
-    }
-}
-
-/// Row-major cartesian sum of per-axis offsets. The innermost axis is a tight
-/// loop; outer axes recurse (rank is small in practice).
-fn fill_indices(axis_offsets: &[Vec<u64>], axis: usize, base: u64, out: &mut Vec<u64>) {
-    if axis_offsets.is_empty() {
-        out.push(base);
-        return;
-    }
-    if axis == axis_offsets.len() - 1 {
-        out.extend(axis_offsets[axis].iter().map(|&off| base + off));
-        return;
-    }
-    for &off in &axis_offsets[axis] {
-        fill_indices(axis_offsets, axis + 1, base + off, out);
+            .collect()
     }
 }
 
@@ -254,6 +269,50 @@ mod tests {
         let picked = map.gather_indices_at(&targets).values().to_vec();
         assert_eq!(picked, vec![full[0], full[2], full[4], full[5]]);
         assert_eq!(picked, vec![0, 2, 1, 2]);
+    }
+
+    /// The fused gather must equal the full gather at the kept cells.
+    fn assert_fused_matches_full(map: &BroadcastMap, target: &Dimensions, selection: &Selection) {
+        let full = indices(map);
+        let expected: Vec<u64> = selection
+            .cell_indices(target)
+            .values()
+            .iter()
+            .map(|&c| full[c as usize])
+            .collect();
+        let fused = map.gather_indices_for(selection).values().to_vec();
+        assert_eq!(fused, expected, "{selection:?}");
+    }
+
+    #[test]
+    fn gather_for_each_selection_state_matches_the_full_gather() {
+        let target = dims(&[("time", 2), ("lat", 3), ("lon", 2)]);
+        let sources = [
+            dims(&[("lat", 3)]),
+            dims(&[("time", 2), ("lat", 3), ("lon", 2)]),
+            dims(&[("lon", 2), ("time", 2)]),
+            Dimensions::scalar(),
+        ];
+        let selections = [
+            Selection::Full,
+            Selection::along_axis(&target, 1, UInt64Array::from(vec![0u64, 2])).unwrap(),
+            Selection::AxisIndices(vec![
+                Some(UInt64Array::from(vec![1u64])),
+                None,
+                Some(UInt64Array::from(vec![0u64])),
+            ]),
+            Selection::Ragged {
+                lengths: UInt64Array::from(vec![2u64, 0, 1, 2, 1, 0]),
+            },
+            Selection::CellMask(UInt64Array::from(vec![0u64, 5, 7, 11])),
+        ];
+        for source in &sources {
+            let map = BroadcastMap::try_new(source, &target).unwrap();
+            for selection in &selections {
+                selection.validate(&target).unwrap();
+                assert_fused_matches_full(&map, &target, selection);
+            }
+        }
     }
 
     #[test]
