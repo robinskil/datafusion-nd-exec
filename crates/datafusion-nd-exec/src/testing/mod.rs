@@ -8,8 +8,10 @@
 
 mod corpus;
 mod differential;
+mod grid_sink;
 mod table;
 
 pub use corpus::{grid_schema, grid_table, profile_schema, profile_table};
 pub use differential::{Differential, sorted_rows};
+pub use grid_sink::MemoryGridSink;
 pub use table::NdMemTable;

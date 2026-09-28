@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use datafusion::datasource::sink::DataSinkExec;
 use datafusion::error::Result;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{PhysicalExpr, conjunction, split_conjunction};
@@ -19,6 +20,7 @@ use crate::exec::{
 };
 use crate::optimizer::is_pushable_expr;
 use crate::registry::{NdNodeRegistry, NdSinker, Sunk};
+use crate::sink::NdDataSinkExec;
 
 /// Sinks the element-wise conjuncts of a `FilterExec` into an
 /// [`NdFilterExec`].
@@ -318,5 +320,42 @@ impl NdSinker for CoalesceSinker {
             )?),
         };
         Ok(Some(Sunk::Below { nd, residual: None }))
+    }
+}
+
+/// Replaces a `DataSinkExec` over a boundary with an [`NdDataSinkExec`], when
+/// a sink factory of the registry gives an nd sink for its sink.
+///
+/// ```text
+/// DataSinkExec[sink]                 NdDataSinkExec[nd sink]
+///   NdBroadcastExec           ->       nd-child
+///     nd-child
+/// ```
+#[derive(Debug, Default)]
+pub struct DataSinkSinker;
+
+impl NdSinker for DataSinkSinker {
+    fn try_sink(
+        &self,
+        parent: &Arc<dyn ExecutionPlan>,
+        children: &[Arc<dyn ExecutionPlan>],
+        registry: &Arc<NdNodeRegistry>,
+    ) -> Result<Option<Sunk>> {
+        let [child] = children else {
+            return Ok(None);
+        };
+        let Some(sink_exec) = parent.as_any().downcast_ref::<DataSinkExec>() else {
+            return Ok(None);
+        };
+        let Some(sink) = registry
+            .sink_factories()
+            .iter()
+            .find_map(|factory| factory.nd_sink(sink_exec.sink()))
+        else {
+            return Ok(None);
+        };
+        let terminal =
+            NdDataSinkExec::try_new_with_registry(child.clone(), sink, registry.clone())?;
+        Ok(Some(Sunk::Terminal(Arc::new(terminal))))
     }
 }

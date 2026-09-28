@@ -41,7 +41,6 @@ use crate::registry::NdNodeRegistry;
 pub use axis_reorder_exec::NdAxisReorderExec;
 pub use broadcast_exec::NdBroadcastExec;
 pub use coalesce_exec::NdCoalescePartitionsExec;
-#[allow(unused_imports)]
 pub(crate) use coalesce_exec::merge_partitions;
 pub use empty_exec::NdEmptyExec;
 pub use filter_exec::NdFilterExec;

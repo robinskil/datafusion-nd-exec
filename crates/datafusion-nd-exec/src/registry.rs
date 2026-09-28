@@ -17,8 +17,10 @@ use crate::exec::{
     NdAxisReorderExec, NdCoalescePartitionsExec, NdEmptyExec, NdExecutionPlan, NdFilterExec,
     NdLimitExec, NdProjectionExec, NdRepartitionExec, NdSourceExec, NdUnionExec,
 };
+use crate::sink::NdSinkFactory;
 use crate::sinkers::{
-    CoalesceSinker, FilterSinker, LimitSinker, ProjectionSinker, RepartitionSinker, UnionSinker,
+    CoalesceSinker, DataSinkSinker, FilterSinker, LimitSinker, ProjectionSinker, RepartitionSinker,
+    UnionSinker,
 };
 
 /// Recognizes the nd node types of one crate. Returns `None` for any other
@@ -68,11 +70,12 @@ pub trait NdSinker: Send + Sync + fmt::Debug {
     ) -> Result<Option<Sunk>>;
 }
 
-/// The probes and sinkers of all nd node types in a session.
+/// The probes, sinkers and sink factories of all nd node types in a session.
 #[derive(Clone, Default)]
 pub struct NdNodeRegistry {
     probes: Vec<NdProbe>,
     sinkers: Vec<Arc<dyn NdSinker>>,
+    sink_factories: Vec<Arc<dyn NdSinkFactory>>,
 }
 
 impl NdNodeRegistry {
@@ -94,6 +97,7 @@ impl NdNodeRegistry {
             .with_sinker(Arc::new(LimitSinker))
             .with_sinker(Arc::new(RepartitionSinker))
             .with_sinker(Arc::new(CoalesceSinker))
+            .with_sinker(Arc::new(DataSinkSinker))
     }
 
     /// A registry with no probes and no sinkers.
@@ -137,6 +141,19 @@ impl NdNodeRegistry {
         &self.sinkers
     }
 
+    pub fn with_sink_factory(mut self, factory: Arc<dyn NdSinkFactory>) -> Self {
+        self.register_sink_factory(factory);
+        self
+    }
+
+    pub fn register_sink_factory(&mut self, factory: Arc<dyn NdSinkFactory>) {
+        self.sink_factories.push(factory);
+    }
+
+    pub fn sink_factories(&self) -> &[Arc<dyn NdSinkFactory>] {
+        &self.sink_factories
+    }
+
     /// Recover the nd side of a plan node, or `None` when no probe knows it.
     pub fn as_nd_plan(&self, plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn NdExecutionPlan>> {
         self.probes.iter().find_map(|probe| probe(plan))
@@ -148,6 +165,7 @@ impl fmt::Debug for NdNodeRegistry {
         f.debug_struct("NdNodeRegistry")
             .field("probes", &self.probes.len())
             .field("sinkers", &self.sinkers)
+            .field("sink_factories", &self.sink_factories)
             .finish()
     }
 }

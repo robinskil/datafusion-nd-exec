@@ -8,17 +8,16 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-test-utils = ["dep:async-trait"]
+test-utils = []
 
 [dependencies]
 nd-arrow-array = { workspace = true }
 arrow = { workspace = true }
 datafusion = { workspace = true }
 futures = { workspace = true }
-async-trait = { workspace = true, optional = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
-async-trait = { workspace = true }
 # Enables the test harness for the integration tests.
 datafusion-nd-exec = { path = ".", features = ["test-utils"] }
 tokio = { workspace = true }
