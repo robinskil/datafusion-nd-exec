@@ -1,0 +1,22 @@
+[package]
+name = "datafusion-nd-exec"
+description = "Grid-native DataFusion execution for n-dimensional data"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[features]
+test-utils = []
+
+[dependencies]
+nd-arrow-array = { workspace = true }
+arrow = { workspace = true }
+datafusion = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

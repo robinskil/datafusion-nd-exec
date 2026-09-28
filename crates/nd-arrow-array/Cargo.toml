@@ -1,0 +1,16 @@
+[package]
+name = "nd-arrow-array"
+description = "N-dimensional Arrow arrays and record batches with named axes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+arrow = { workspace = true }
+arrow-schema = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

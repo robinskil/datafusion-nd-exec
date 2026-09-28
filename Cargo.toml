@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = ["crates/nd-arrow-array", "crates/datafusion-nd-exec"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+repository = "https://github.com/robinskil/datafusion-nd-exec"
+
+[workspace.dependencies]
+nd-arrow-array = { path = "crates/nd-arrow-array", version = "0.1.0" }
+arrow = "^58"
+arrow-schema = "^58"
+datafusion = "^53"
+futures = "0.3.31"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
