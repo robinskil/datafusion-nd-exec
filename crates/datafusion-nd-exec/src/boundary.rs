@@ -7,9 +7,8 @@
 //! below the boundary and looks at the next node up. If none does, the region
 //! stops there.
 //!
-//! A round-robin `RepartitionExec` between the node and the boundary does not
-//! stop the rule. Element-wise nodes commute with it, so the rule keeps it
-//! above the new boundary.
+//! A round-robin `RepartitionExec` above a boundary sinks as an
+//! `NdRepartitionExec`, so the nodes above it see the boundary next.
 //!
 //! [`NdSinker`]: crate::registry::NdSinker
 
@@ -19,8 +18,7 @@ use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::error::Result;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_plan::repartition::RepartitionExec;
-use datafusion::physical_plan::{ExecutionPlan, Partitioning};
+use datafusion::physical_plan::ExecutionPlan;
 
 use nd_arrow_array::SelectionKind;
 
@@ -41,20 +39,9 @@ impl NdBoundaryRule {
     /// Sink `node` below the boundaries under it, if a sinker accepts it.
     /// Every child of `node` must be a boundary.
     fn sink(&self, node: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
-        let mut belows: Vec<Arc<dyn ExecutionPlan>> =
-            node.children().into_iter().cloned().collect();
+        let belows = node.children();
         if belows.is_empty() {
             return Ok(Transformed::no(node));
-        }
-        // The round-robin repartitions between a one-child `node` and the
-        // boundary, top down.
-        let mut passthrough = Vec::new();
-        if let [below] = &mut belows[..] {
-            while is_round_robin(below) {
-                passthrough.push(below.clone());
-                let next = below.children()[0].clone();
-                *below = next;
-            }
         }
         let mut nd_children = Vec::with_capacity(belows.len());
         let mut child_selection = SelectionKind::Full;
@@ -77,9 +64,6 @@ impl NdBoundaryRule {
             let mut rebuilt: Arc<dyn ExecutionPlan> = Arc::new(
                 NdBroadcastExec::try_new_with_registry(sunk.nd, self.registry.clone())?,
             );
-            for repartition in passthrough.iter().rev() {
-                rebuilt = repartition.clone().with_new_children(vec![rebuilt])?;
-            }
             if let Some(residual) = sunk.residual {
                 rebuilt = residual.with_new_children(vec![rebuilt])?;
             }
@@ -87,12 +71,6 @@ impl NdBoundaryRule {
         }
         Ok(Transformed::no(node))
     }
-}
-
-fn is_round_robin(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    plan.as_any()
-        .downcast_ref::<RepartitionExec>()
-        .is_some_and(|r| matches!(r.partitioning(), Partitioning::RoundRobinBatch(_)))
 }
 
 impl PhysicalOptimizerRule for NdBoundaryRule {

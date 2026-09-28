@@ -12,6 +12,7 @@ mod expr_column;
 mod filter_exec;
 mod limit_exec;
 mod projection_exec;
+mod repartition_exec;
 mod source_exec;
 mod union_exec;
 
@@ -38,6 +39,7 @@ pub use broadcast_exec::NdBroadcastExec;
 pub use filter_exec::NdFilterExec;
 pub use limit_exec::NdLimitExec;
 pub use projection_exec::NdProjectionExec;
+pub use repartition_exec::NdRepartitionExec;
 pub use source_exec::NdSourceExec;
 pub use union_exec::NdUnionExec;
 

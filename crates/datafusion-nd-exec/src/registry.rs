@@ -14,9 +14,10 @@ use datafusion::execution::config::SessionConfig;
 use datafusion::physical_plan::ExecutionPlan;
 
 use crate::exec::{
-    NdExecutionPlan, NdFilterExec, NdLimitExec, NdProjectionExec, NdSourceExec, NdUnionExec,
+    NdExecutionPlan, NdFilterExec, NdLimitExec, NdProjectionExec, NdRepartitionExec, NdSourceExec,
+    NdUnionExec,
 };
-use crate::sinkers::{FilterSinker, LimitSinker, ProjectionSinker, UnionSinker};
+use crate::sinkers::{FilterSinker, LimitSinker, ProjectionSinker, RepartitionSinker, UnionSinker};
 
 /// Recognizes the nd node types of one crate. Returns `None` for any other
 /// node.
@@ -76,10 +77,12 @@ impl NdNodeRegistry {
             .with_probe(probe_for::<NdFilterExec>())
             .with_probe(probe_for::<NdUnionExec>())
             .with_probe(probe_for::<NdLimitExec>())
+            .with_probe(probe_for::<NdRepartitionExec>())
             .with_sinker(Arc::new(FilterSinker))
             .with_sinker(Arc::new(ProjectionSinker))
             .with_sinker(Arc::new(UnionSinker))
             .with_sinker(Arc::new(LimitSinker))
+            .with_sinker(Arc::new(RepartitionSinker))
     }
 
     /// A registry with no probes and no sinkers.

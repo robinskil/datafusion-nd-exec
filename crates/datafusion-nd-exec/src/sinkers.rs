@@ -8,10 +8,13 @@ use datafusion::physical_expr::{PhysicalExpr, conjunction, split_conjunction};
 use datafusion::physical_plan::filter::{FilterExec, FilterExecBuilder};
 use datafusion::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::union::UnionExec;
-use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, Partitioning};
 
-use crate::exec::{NdExecutionPlan, NdFilterExec, NdLimitExec, NdProjectionExec, NdUnionExec};
+use crate::exec::{
+    NdExecutionPlan, NdFilterExec, NdLimitExec, NdProjectionExec, NdRepartitionExec, NdUnionExec,
+};
 use crate::optimizer::is_pushable_expr;
 use crate::registry::{NdNodeRegistry, NdSinker, Sunk};
 
@@ -229,6 +232,46 @@ impl NdSinker for LimitSinker {
             return Ok(None);
         };
         let nd = NdLimitExec::try_new_with_registry(child.clone(), skip, fetch, registry.clone())?;
+        Ok(Some(Sunk {
+            nd: Arc::new(nd),
+            residual: None,
+        }))
+    }
+}
+
+/// Sinks a round-robin `RepartitionExec` into an [`NdRepartitionExec`].
+///
+/// ```text
+/// RepartitionExec[RoundRobin(n)]     NdBroadcastExec
+///   NdBroadcastExec           ->       NdRepartitionExec[n]
+///     nd-child                           nd-child
+/// ```
+///
+/// An order-preserving repartition stays above the boundary.
+#[derive(Debug, Default)]
+pub struct RepartitionSinker;
+
+impl NdSinker for RepartitionSinker {
+    fn try_sink(
+        &self,
+        parent: &Arc<dyn ExecutionPlan>,
+        children: &[Arc<dyn ExecutionPlan>],
+        registry: &Arc<NdNodeRegistry>,
+    ) -> Result<Option<Sunk>> {
+        let [child] = children else {
+            return Ok(None);
+        };
+        let Some(repartition) = parent.as_any().downcast_ref::<RepartitionExec>() else {
+            return Ok(None);
+        };
+        let Partitioning::RoundRobinBatch(partitions) = repartition.partitioning() else {
+            return Ok(None);
+        };
+        if repartition.preserve_order() {
+            return Ok(None);
+        }
+        let nd =
+            NdRepartitionExec::try_new_with_registry(child.clone(), *partitions, registry.clone())?;
         Ok(Some(Sunk {
             nd: Arc::new(nd),
             residual: None,
