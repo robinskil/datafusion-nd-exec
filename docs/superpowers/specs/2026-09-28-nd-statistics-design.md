@@ -27,7 +27,6 @@ The values are Arrow arrays, so the types have no DataFusion dependency.
 
 ```rust
 pub struct NdDatasetStatistics {
-    pub location: String,
     pub axes: Vec<NdAxisStatistics>,
     pub variables: Vec<NdVariableStatistics>,
 }
@@ -82,26 +81,54 @@ Calendar steps, such as months, are `Explicit`.
 ```rust
 #[async_trait]
 pub trait NdStatisticsProvider: Send + Sync {
-    /// The grid of the dataset at `location`, from metadata only.
-    async fn dataset_statistics(&self, location: &str) -> Result<NdDatasetStatistics>;
+    /// The grid of the dataset `object` in `store`, from metadata only.
+    async fn dataset_statistics(
+        &self,
+        state: &dyn Session,
+        store: &Arc<dyn ObjectStore>,
+        object: &ObjectMeta,
+    ) -> Result<NdDatasetStatistics>;
+}
+
+/// One dataset of a table: its object and its statistics.
+pub struct NdDataset {
+    pub object: ObjectMeta,
+    pub statistics: NdDatasetStatistics,
 }
 ```
 
-A format implements it. For Zarr: the array metadata (`dimension_names`,
-`shape`, `chunks`) and the 1-D coordinate arrays. For netCDF: the header and
-the coordinate variables. A host caches the results.
+The signature follows DataFusion's `FileFormat::infer_stats`, and
+`ObjectStore` and `ObjectMeta` come from the `object_store` crate that
+DataFusion re-exports. So:
+
+- the provider reads the metadata through the store of the table, with the session config;
+- the merge returns the dataset order as `ObjectMeta`s, so a format builds its `PartitionedFile`s from them at once;
+- a host can key a cache on the location with `e_tag` or `last_modified`.
+
+The statistics types stay in `nd-arrow-array` without a location, because that
+crate depends on Arrow only. `NdDataset` pairs them with their object.
+
+A format implements the provider. For Zarr: the array metadata
+(`dimension_names`, `shape`, `chunks`) and the 1-D coordinate arrays. For
+netCDF: the header and the coordinate variables. A host caches the results.
+
+A Zarr store is a prefix, not one object. Its `ObjectMeta` is the root
+metadata object (`zarr.json`, or `.zmetadata` for consolidated v2 metadata).
+A rewrite of the coordinate chunks alone does not change that object, so a
+cache keyed on its `e_tag` misses that change. A host that rewrites
+coordinates must drop the cache entry.
 
 ## 3. Merge (`NdTableStatistics`)
 
-`NdTableStatistics::merge(datasets, growth_axis: Option<&str>)` combines the
-datasets of a table:
+`NdTableStatistics::merge(datasets: Vec<NdDataset>, growth_axis: Option<&str>)`
+combines the datasets of a table:
 
 - **Reference grid:** the axis set of the first dataset. The growth axis is the named axis, else the first axis of the widest variable.
 - **Seeds:** per axis, the union of the values of all datasets, sorted ascending unless every dataset is strictly descending, with duplicates removed. An axis with a `Summary` dataset gets no seed.
 - **Extents:** the seed length per axis, or `None` without a seed.
-- **Dataset order:** the datasets sorted by the minimum of the growth-axis coordinate. Without a coordinate on the growth axis, the input order.
+- **Dataset order:** the `ObjectMeta`s sorted by the minimum of the growth-axis coordinate. Without a coordinate on the growth axis, the input order.
 - **Issues:** a list, not errors, so the host decides:
-  - `AxisSetDiffers { location, axes }`: a dataset with another axis set.
+  - `AxisSetDiffers { location, axes }`: a dataset with another axis set. `location` is the object path.
   - `InnerGridDiffers { location, axis }`: another fingerprint on an inner axis.
   - `GrowthOverlap { first, second }`: two datasets whose growth-axis ranges overlap, unless their values are equal.
   - `NoSeed { axis }`: a coordinate axis with a `Summary` dataset.
@@ -114,7 +141,7 @@ datasets of a table:
 
 ## 4. DataFusion statistics
 
-`column_statistics(&dataset, &schema) -> datafusion::common::Statistics`:
+`column_statistics(&dataset.statistics, &schema) -> datafusion::common::Statistics`:
 
 - The min and max of each coordinate column, exact.
 - The row count: the cell count of the full grid, as `Inexact`, because the row count of a scan depends on the selected columns.
@@ -154,7 +181,7 @@ no chunk fills. Those cells are null.
 
 ## 6. Test support
 
-- `NdMemTable` implements `NdStatisticsProvider`: it derives the statistics of each partition from its chunks.
+- `NdMemTable` implements `NdStatisticsProvider`: it derives the statistics of each partition from its chunks. Each partition gets an `ObjectMeta` with a made-up location, and the store argument is not used.
 - `NdMemTable::with_grid_hint()` merges them and puts the hint on its scan.
 - `MemoryGridSink` seeds its accumulator from the hint it gets.
 
