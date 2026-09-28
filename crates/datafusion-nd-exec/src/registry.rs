@@ -14,6 +14,7 @@ use datafusion::execution::config::SessionConfig;
 use datafusion::physical_plan::ExecutionPlan;
 
 use crate::exec::{NdExecutionPlan, NdFilterExec, NdProjectionExec, NdSourceExec};
+use crate::sinkers::{FilterSinker, ProjectionSinker};
 
 /// Recognizes the nd node types of one crate. Returns `None` for any other
 /// node.
@@ -47,10 +48,12 @@ pub struct Sunk {
 pub trait NdSinker: Send + Sync + fmt::Debug {
     /// Return the nd replacement of `parent` over `child`, or `None` when
     /// `parent` is not a node kind of this sinker or cannot operate on grids.
+    /// `child` is the nd child of the boundary under `parent`. Build the
+    /// replacement with `registry`.
     fn try_sink(
         &self,
         parent: &Arc<dyn ExecutionPlan>,
-        child: &Arc<dyn NdExecutionPlan>,
+        child: &Arc<dyn ExecutionPlan>,
         registry: &Arc<NdNodeRegistry>,
     ) -> Result<Option<Sunk>>;
 }
@@ -63,12 +66,14 @@ pub struct NdNodeRegistry {
 }
 
 impl NdNodeRegistry {
-    /// A registry with the built-in nd nodes of this crate.
+    /// A registry with the built-in nd nodes and sinkers of this crate.
     pub fn new() -> Self {
         Self::empty()
             .with_probe(probe_for::<NdSourceExec>())
             .with_probe(probe_for::<NdProjectionExec>())
             .with_probe(probe_for::<NdFilterExec>())
+            .with_sinker(Arc::new(FilterSinker))
+            .with_sinker(Arc::new(ProjectionSinker))
     }
 
     /// A registry with no probes and no sinkers.

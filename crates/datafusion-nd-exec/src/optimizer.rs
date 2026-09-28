@@ -1,194 +1,13 @@
-//! Physical optimizer rule: sink element-wise projections below the broadcast.
-//!
-//! DataFusion plans a `ProjectionExec` above [`NdBroadcastExec`], so projection
-//! expressions run *after* the full grid is materialized. When every output
-//! expression is element-wise (its value at a grid cell depends only on its
-//! inputs at that cell), the projection can instead run on the un-broadcast nd
-//! columns — evaluated on each expression's footprint sub-grid — and be
-//! broadcast afterwards. This rule rewrites
-//!
-//! ```text
-//! ProjectionExec[exprs]              NdBroadcastExec
-//!   NdBroadcastExec           ->       NdProjectionExec[exprs]
-//!     nd-child                           nd-child
-//! ```
-//!
-//! Broadcasting commutes with element-wise evaluation, so the result is
-//! identical — but a projection touching only a coordinate axis now evaluates
-//! over that axis instead of the full cross-product.
+//! Which expressions can run below the nd boundary.
 
 use std::sync::Arc;
 
-use datafusion::common::config::ConfigOptions;
-use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::error::Result;
 use datafusion::logical_expr::Volatility;
-use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{
     BinaryExpr, CaseExpr, CastExpr, Column, IsNotNullExpr, IsNullExpr, Literal, NegativeExpr,
     NotExpr, TryCastExpr,
 };
-use datafusion::physical_expr::{ScalarFunctionExpr, conjunction, split_conjunction};
-use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_plan::filter::FilterExec;
-use datafusion::physical_plan::projection::ProjectionExec;
-
-use crate::exec::{NdBroadcastExec, NdFilterExec, NdProjectionExec};
-
-/// Sinks element-wise `ProjectionExec`s below an [`NdBroadcastExec`] into an
-/// [`NdProjectionExec`], so they evaluate before broadcasting.
-#[derive(Debug, Default)]
-pub struct NdProjectionPushdown;
-
-impl NdProjectionPushdown {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl PhysicalOptimizerRule for NdProjectionPushdown {
-    fn optimize(
-        &self,
-        plan: Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        plan.transform_down(|node| {
-            let Some(projection) = node.as_any().downcast_ref::<ProjectionExec>() else {
-                return Ok(Transformed::no(node));
-            };
-            let Some(broadcast) = projection
-                .input()
-                .as_any()
-                .downcast_ref::<NdBroadcastExec>()
-            else {
-                return Ok(Transformed::no(node));
-            };
-
-            // Only sink when every output expression is safe to evaluate before
-            // broadcast; a mixed projection is left in place.
-            if !projection
-                .expr()
-                .iter()
-                .all(|pe| is_pushable_expr(&pe.expr))
-            {
-                return Ok(Transformed::no(node));
-            }
-
-            let exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = projection
-                .expr()
-                .iter()
-                .map(|pe| (pe.expr.clone(), pe.alias.clone()))
-                .collect();
-
-            // Preserve the projection's exact output schema so the rewrite is
-            // schema-preserving for the optimizer's schema check.
-            let nd_projection = Arc::new(NdProjectionExec::try_new_with_schema(
-                broadcast.input().clone(),
-                exprs,
-                Some(projection.schema()),
-            )?);
-            let new_broadcast = Arc::new(NdBroadcastExec::try_new(nd_projection)?);
-            Ok(Transformed::yes(new_broadcast as Arc<dyn ExecutionPlan>))
-        })
-        .map(|t| t.data)
-    }
-
-    fn name(&self) -> &str {
-        "NdProjectionPushdown"
-    }
-
-    fn schema_check(&self) -> bool {
-        true
-    }
-}
-
-/// Sinks the element-wise conjuncts of a `FilterExec` below an
-/// [`NdBroadcastExec`] into an [`NdFilterExec`], so the predicate selects rows on
-/// the un-broadcast nd columns and the broadcast fuses with the selection.
-///
-/// DataFusion plans a `FilterExec` above [`NdBroadcastExec`], so the `WHERE`
-/// predicate runs *after* the full grid is materialized. A predicate is a
-/// conjunction; each element-wise conjunct (its value at a grid cell depends only
-/// on its inputs there) can instead be evaluated before broadcast — on its
-/// footprint sub-grid — and recorded as a grid selection the broadcast applies.
-/// This rule rewrites
-///
-/// ```text
-/// FilterExec[a AND b AND c]          FilterExec[c]            (residual, only if any)
-///   NdBroadcastExec           ->       NdBroadcastExec
-///     nd-child                           NdFilterExec[a, b]   (element-wise conjuncts)
-///                                          nd-child
-/// ```
-///
-/// where `a`, `b` are element-wise ([`is_pushable_expr`]) and `c` is not (e.g. a
-/// volatile function or a subquery). If every conjunct is pushable, the residual
-/// `FilterExec` is dropped entirely. The rewrite is schema-preserving: a filter
-/// never changes columns.
-#[derive(Debug, Default)]
-pub struct NdFilterPushdown;
-
-impl NdFilterPushdown {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl PhysicalOptimizerRule for NdFilterPushdown {
-    fn optimize(
-        &self,
-        plan: Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        plan.transform_down(|node| {
-            let Some(filter) = node.as_any().downcast_ref::<FilterExec>() else {
-                return Ok(Transformed::no(node));
-            };
-            // A `FilterExec` carrying an embedded projection also changes the
-            // schema; leave those in place so the rewrite stays a pure row
-            // selection.
-            if filter.projection().is_some() {
-                return Ok(Transformed::no(node));
-            }
-            let Some(broadcast) = filter.input().as_any().downcast_ref::<NdBroadcastExec>() else {
-                return Ok(Transformed::no(node));
-            };
-
-            // Split the predicate and route each conjunct: element-wise ones sink
-            // into the nd filter, the rest stay in a residual filter above.
-            let mut push: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
-            let mut keep: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
-            for conjunct in split_conjunction(filter.predicate()) {
-                if is_pushable_expr(conjunct) {
-                    push.push(conjunct.clone());
-                } else {
-                    keep.push(conjunct.clone());
-                }
-            }
-            if push.is_empty() {
-                return Ok(Transformed::no(node));
-            }
-
-            let nd_filter = Arc::new(NdFilterExec::try_new(broadcast.input().clone(), push)?);
-            let new_broadcast = Arc::new(NdBroadcastExec::try_new(nd_filter)?);
-            let rewritten: Arc<dyn ExecutionPlan> = if keep.is_empty() {
-                new_broadcast
-            } else {
-                Arc::new(FilterExec::try_new(conjunction(keep), new_broadcast)?)
-            };
-            Ok(Transformed::yes(rewritten))
-        })
-        .map(|t| t.data)
-    }
-
-    fn name(&self) -> &str {
-        "NdFilterPushdown"
-    }
-
-    fn schema_check(&self) -> bool {
-        true
-    }
-}
+use datafusion::physical_expr::{PhysicalExpr, ScalarFunctionExpr};
 
 /// Whether an expression can be evaluated before broadcast and give the same
 /// result after broadcast — i.e. it is element-wise and deterministic.
@@ -235,6 +54,7 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::common::config::ConfigOptions;
+    use datafusion::error::Result;
     use datafusion::logical_expr::{
         ColumnarValue, Operator, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
         Volatility,

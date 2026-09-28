@@ -29,6 +29,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use futures::StreamExt;
+use nd_arrow_array::SelectionKind;
 
 use nd_arrow_array::batch::NdRecordBatch;
 
@@ -256,6 +257,11 @@ impl ExecutionPlan for NdProjectionExec {
 }
 
 impl NdExecutionPlan for NdProjectionExec {
+    /// A projection passes the selection of its child through.
+    fn max_output_selection(&self) -> SelectionKind {
+        self.nd_input.max_output_selection()
+    }
+
     fn execute_nd(
         &self,
         partition: usize,

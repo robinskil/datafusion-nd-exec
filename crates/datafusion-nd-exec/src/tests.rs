@@ -15,8 +15,9 @@ use futures::TryStreamExt;
 use nd_arrow_array::encoding::encode_nd_record_batch;
 use nd_arrow_array::{Dimension, Dimensions, NdArrowArray, NdRecordBatch};
 
+use crate::boundary::NdBoundaryRule;
 use crate::exec::{NdBroadcastExec, NdSourceExec};
-use crate::optimizer::{NdFilterPushdown, NdProjectionPushdown};
+use crate::registry::NdNodeRegistry;
 
 fn dims(spec: &[(&str, usize)]) -> Dimensions {
     Dimensions::try_new(
@@ -398,7 +399,7 @@ async fn pushdown_rule_sinks_projection_below_broadcast() {
     let original_schema = original.schema();
     let expected = run(original.clone()).await.unwrap();
 
-    let optimized = NdProjectionPushdown::new()
+    let optimized = NdBoundaryRule::new(NdNodeRegistry::shared_default())
         .optimize(original, &ConfigOptions::default())
         .unwrap();
 
@@ -480,7 +481,7 @@ async fn pushdown_rule_skips_non_elementwise() {
         .unwrap(),
     );
 
-    let optimized = NdProjectionPushdown::new()
+    let optimized = NdBoundaryRule::new(NdNodeRegistry::shared_default())
         .optimize(original, &ConfigOptions::default())
         .unwrap();
     let rendered = displayable(optimized.as_ref()).indent(true).to_string();
@@ -829,7 +830,7 @@ async fn pushdown_rule_sinks_filter_below_broadcast() {
     let original_schema = original.schema();
     let expected = run(original.clone()).await.unwrap();
 
-    let optimized = NdFilterPushdown::new()
+    let optimized = NdBoundaryRule::new(NdNodeRegistry::shared_default())
         .optimize(original, &ConfigOptions::default())
         .unwrap();
 
@@ -928,7 +929,7 @@ async fn pushdown_rule_splits_mixed_predicate() {
         .unwrap(),
     );
 
-    let optimized = NdFilterPushdown::new()
+    let optimized = NdBoundaryRule::new(NdNodeRegistry::shared_default())
         .optimize(original, &ConfigOptions::default())
         .unwrap();
     let rendered = displayable(optimized.as_ref()).indent(true).to_string();

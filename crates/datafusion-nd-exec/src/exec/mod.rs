@@ -28,7 +28,7 @@ use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
-use nd_arrow_array::NdRecordBatch;
+use nd_arrow_array::{NdRecordBatch, SelectionKind};
 
 use crate::registry::NdNodeRegistry;
 
@@ -81,6 +81,16 @@ pub trait NdExecutionPlan: ExecutionPlan {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableNdBatchStream>;
+
+    /// The finest [`SelectionKind`] that this node accepts from its nd child.
+    fn accepts_selection(&self) -> SelectionKind {
+        SelectionKind::CellMask
+    }
+
+    /// The finest [`SelectionKind`] that this node can output.
+    fn max_output_selection(&self) -> SelectionKind {
+        SelectionKind::CellMask
+    }
 }
 
 /// Resolve the nd side of `input` through `registry`, or fail with a plan

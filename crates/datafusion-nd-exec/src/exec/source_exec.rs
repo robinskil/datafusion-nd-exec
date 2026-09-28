@@ -18,6 +18,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use futures::{StreamExt, TryStreamExt};
+use nd_arrow_array::SelectionKind;
 
 use nd_arrow_array::encoding::{decode_nd_record_batch_row, logical_schema, nd_batch_count};
 
@@ -135,6 +136,11 @@ impl ExecutionPlan for NdSourceExec {
 }
 
 impl NdExecutionPlan for NdSourceExec {
+    /// A decoded batch keeps every cell.
+    fn max_output_selection(&self) -> SelectionKind {
+        SelectionKind::Full
+    }
+
     fn execute_nd(
         &self,
         partition: usize,

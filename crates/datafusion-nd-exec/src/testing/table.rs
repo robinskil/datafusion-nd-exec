@@ -116,7 +116,21 @@ impl TableProvider for NdMemTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let registry = NdNodeRegistry::from_session_config(state.config());
+        self.nd_scan(
+            projection,
+            NdNodeRegistry::from_session_config(state.config()),
+        )
+    }
+}
+
+impl NdMemTable {
+    /// The scan plan `NdBroadcastExec(NdSourceExec(DataSourceExec))` of the
+    /// columns in `projection`, with nd nodes resolved through `registry`.
+    pub fn nd_scan(
+        &self,
+        projection: Option<&Vec<usize>>,
+        registry: Arc<NdNodeRegistry>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         let memory = match projection {
             // A zero-column scan (`count(*)`) carries the cell count of each
             // batch as the row count.

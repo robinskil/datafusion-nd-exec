@@ -19,7 +19,7 @@ use datafusion_nd_exec::array::{Dimension, Dimensions, NdArrowArray, NdRecordBat
 use datafusion_nd_exec::exec::{
     NdBroadcastExec, NdExecutionPlan, NdSourceExec, SendableNdBatchStream,
 };
-use datafusion_nd_exec::{NdNodeRegistry, probe_for};
+use datafusion_nd_exec::{NdNodeRegistry, NdSinker, Sunk, probe_for};
 use futures::TryStreamExt;
 
 /// An nd node of another crate: it passes nd batches through unchanged.
@@ -164,4 +164,116 @@ fn the_session_registry_falls_back_to_the_default() {
         &NdNodeRegistry::from_session_config(&config),
         &custom
     ));
+}
+
+/// A flat node of another crate: it passes flat batches through unchanged.
+#[derive(Debug)]
+struct FlatTagExec {
+    input: Arc<dyn ExecutionPlan>,
+}
+
+impl DisplayAs for FlatTagExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "FlatTagExec")
+    }
+}
+
+impl ExecutionPlan for FlatTagExec {
+    fn name(&self) -> &str {
+        "FlatTagExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        self.input.properties()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self {
+            input: children.remove(0),
+        }))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        self.input.execute(partition, context)
+    }
+}
+
+/// The sink check of the other crate: a `FlatTagExec` becomes an `NdTagExec`.
+#[derive(Debug)]
+struct TagSinker;
+
+impl NdSinker for TagSinker {
+    fn try_sink(
+        &self,
+        parent: &Arc<dyn ExecutionPlan>,
+        child: &Arc<dyn ExecutionPlan>,
+        registry: &Arc<NdNodeRegistry>,
+    ) -> Result<Option<Sunk>> {
+        if !parent.as_any().is::<FlatTagExec>() {
+            return Ok(None);
+        }
+        let nd = NdTagExec::try_new(child.clone(), registry.clone())?;
+        Ok(Some(Sunk {
+            nd: Arc::new(nd),
+            residual: None,
+        }))
+    }
+}
+
+#[tokio::test]
+async fn the_boundary_rule_sinks_a_node_of_another_crate() {
+    use datafusion::common::config::ConfigOptions;
+    use datafusion::physical_optimizer::PhysicalOptimizerRule;
+    use datafusion::physical_plan::displayable;
+    use datafusion_nd_exec::NdBoundaryRule;
+
+    let plan = || -> Arc<dyn ExecutionPlan> {
+        Arc::new(FlatTagExec {
+            input: Arc::new(NdBroadcastExec::try_new(source()).unwrap()),
+        })
+    };
+
+    // The default registry has no sinker for the node.
+    let unchanged = NdBoundaryRule::new(NdNodeRegistry::shared_default())
+        .optimize(plan(), &ConfigOptions::default())
+        .unwrap();
+    assert_eq!(unchanged.name(), "FlatTagExec");
+
+    let registry = Arc::new(
+        NdNodeRegistry::new()
+            .with_probe(probe_for::<NdTagExec>())
+            .with_sinker(Arc::new(TagSinker)),
+    );
+    let optimized = NdBoundaryRule::new(registry)
+        .optimize(plan(), &ConfigOptions::default())
+        .unwrap();
+    let rendered = displayable(optimized.as_ref()).indent(true).to_string();
+    assert!(
+        rendered.starts_with("NdBroadcastExec: region=[NdTagExec, NdSourceExec]"),
+        "{rendered}"
+    );
+
+    let schema = optimized.schema();
+    let batches: Vec<_> = optimized
+        .execute(0, Arc::new(TaskContext::default()))
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(concat_batches(&schema, &batches).unwrap().num_rows(), 4);
 }

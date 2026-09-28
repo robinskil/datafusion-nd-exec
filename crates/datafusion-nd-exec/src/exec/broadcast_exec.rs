@@ -67,6 +67,21 @@ impl NdBroadcastExec {
         &self.nd_input
     }
 
+    /// The names of the nd nodes below this boundary, top down.
+    pub fn region(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut node = self.input.clone();
+        loop {
+            names.push(node.name().to_string());
+            let next = match node.children()[..] {
+                [child] if self.registry.as_nd_plan(child).is_some() => child.clone(),
+                _ => break,
+            };
+            node = next;
+        }
+        names
+    }
+
     /// The nd-aware child whose batches this node materializes.
     pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
         &self.input
@@ -75,7 +90,7 @@ impl NdBroadcastExec {
 
 impl DisplayAs for NdBroadcastExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "NdBroadcastExec")
+        write!(f, "NdBroadcastExec: region=[{}]", self.region().join(", "))
     }
 }
 
