@@ -55,6 +55,21 @@ async fn grid_queries_match_the_flat_path() -> Result<()> {
 }
 
 #[tokio::test]
+async fn limits_match_the_flat_row_count() -> Result<()> {
+    let harness = harness()?;
+    for sql in [
+        "SELECT * FROM grid LIMIT 5",
+        "SELECT * FROM grid LIMIT 5 OFFSET 20",
+        "SELECT * FROM grid WHERE lat > 0 LIMIT 3",
+        "SELECT lat FROM grid LIMIT 100",
+        "SELECT * FROM profiles LIMIT 4 OFFSET 2",
+    ] {
+        harness.assert_same_row_count(sql).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn profile_queries_match_the_flat_path() -> Result<()> {
     let harness = harness()?;
     for sql in PROFILE_QUERIES {

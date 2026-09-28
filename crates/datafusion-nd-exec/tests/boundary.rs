@@ -229,16 +229,41 @@ async fn an_unsinkable_node_above_a_sinkable_node() -> Result<()> {
     Ok(())
 }
 
-/// A filter with a limit does not sink: the limit would be lost.
+/// A filter with a limit sinks with an `NdLimitExec` on top.
 #[tokio::test]
-async fn a_filter_with_a_limit_stays_above_the_broadcast() -> Result<()> {
+async fn a_filter_with_a_limit_sinks_with_its_limit() -> Result<()> {
     let scan = scan()?;
     let filter: Arc<dyn ExecutionPlan> = Arc::new(
         FilterExecBuilder::new(lat_above_zero(&scan)?, scan)
             .with_fetch(Some(2))
             .build()?,
     );
+    let expected = collect(filter.clone(), Arc::new(TaskContext::default())).await?;
     let optimized = optimize(filter)?;
-    assert_eq!(node_names(&optimized)[0], "FilterExec");
+    assert_eq!(
+        node_names(&optimized),
+        [
+            "NdBroadcastExec",
+            "NdLimitExec",
+            "NdFilterExec",
+            "NdSourceExec",
+            "DataSourceExec"
+        ]
+    );
+    let actual = collect(optimized, Arc::new(TaskContext::default())).await?;
+    assert_eq!(
+        actual.iter().map(|b| b.num_rows()).sum::<usize>(),
+        expected.iter().map(|b| b.num_rows()).sum::<usize>()
+    );
     Ok(())
+}
+
+#[tokio::test]
+async fn a_limit_runs_below_the_broadcast() -> Result<()> {
+    harness()?
+        .assert_plan_nodes(
+            "SELECT * FROM grid LIMIT 5",
+            &["NdBroadcastExec", "NdLimitExec", "NdSourceExec"],
+        )
+        .await
 }

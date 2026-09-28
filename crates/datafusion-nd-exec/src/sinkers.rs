@@ -5,12 +5,13 @@ use std::sync::Arc;
 use datafusion::error::Result;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{PhysicalExpr, conjunction, split_conjunction};
-use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::filter::{FilterExec, FilterExecBuilder};
+use datafusion::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::union::UnionExec;
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
-use crate::exec::{NdExecutionPlan, NdFilterExec, NdProjectionExec, NdUnionExec};
+use crate::exec::{NdExecutionPlan, NdFilterExec, NdLimitExec, NdProjectionExec, NdUnionExec};
 use crate::optimizer::is_pushable_expr;
 use crate::registry::{NdNodeRegistry, NdSinker, Sunk};
 
@@ -25,9 +26,9 @@ use crate::registry::{NdNodeRegistry, NdSinker, Sunk};
 /// ```
 ///
 /// `a` and `b` are element-wise ([`is_pushable_expr`]). `c` is not, for
-/// example a volatile function. The embedded projection of the filter goes
-/// below the boundary as an [`NdProjectionExec`] when no residual stays, else
-/// it stays on the residual.
+/// example a volatile function. The embedded projection and limit of the
+/// filter go below the boundary as an [`NdProjectionExec`] and an
+/// [`NdLimitExec`] when no residual stays, else they stay on the residual.
 #[derive(Debug, Default)]
 pub struct FilterSinker;
 
@@ -44,11 +45,6 @@ impl NdSinker for FilterSinker {
         let Some(filter) = parent.as_any().downcast_ref::<FilterExec>() else {
             return Ok(None);
         };
-        // A limit on the filter would be lost below the boundary.
-        if filter.fetch().is_some() {
-            return Ok(None);
-        }
-
         let (push, keep): (Vec<_>, Vec<_>) = split_conjunction(filter.predicate())
             .into_iter()
             .cloned()
@@ -65,7 +61,7 @@ impl NdSinker for FilterSinker {
         let projection = filter.projection().as_ref().map(|p| p.to_vec());
 
         if keep.is_empty() {
-            let nd = match projection {
+            let nd: Arc<dyn NdExecutionPlan> = match projection {
                 None => nd_filter,
                 Some(indices) => {
                     let schema = child.schema();
@@ -85,6 +81,15 @@ impl NdSinker for FilterSinker {
                     )?)
                 }
             };
+            let nd: Arc<dyn NdExecutionPlan> = match filter.fetch() {
+                None => nd,
+                Some(fetch) => Arc::new(NdLimitExec::try_new_with_registry(
+                    nd,
+                    0,
+                    Some(fetch),
+                    registry.clone(),
+                )?),
+            };
             return Ok(Some(Sunk { nd, residual: None }));
         }
 
@@ -93,6 +98,7 @@ impl NdSinker for FilterSinker {
         let residual = FilterExecBuilder::new(conjunction(keep), filter.input().clone())
             .apply_projection(projection)?
             .with_default_selectivity(filter.default_selectivity())
+            .with_fetch(filter.fetch())
             .build()?;
         Ok(Some(Sunk {
             nd: nd_filter,
@@ -182,6 +188,47 @@ impl NdSinker for UnionSinker {
             return Ok(None);
         }
         let nd = NdUnionExec::try_new_with_registry(children.to_vec(), registry.clone())?;
+        Ok(Some(Sunk {
+            nd: Arc::new(nd),
+            residual: None,
+        }))
+    }
+}
+
+/// Sinks a `LocalLimitExec`, or a `GlobalLimitExec` over one partition, into
+/// an [`NdLimitExec`].
+///
+/// ```text
+/// LocalLimitExec[fetch]              NdBroadcastExec
+///   NdBroadcastExec           ->       NdLimitExec[fetch]
+///     nd-child                           nd-child
+/// ```
+#[derive(Debug, Default)]
+pub struct LimitSinker;
+
+impl NdSinker for LimitSinker {
+    fn try_sink(
+        &self,
+        parent: &Arc<dyn ExecutionPlan>,
+        children: &[Arc<dyn ExecutionPlan>],
+        registry: &Arc<NdNodeRegistry>,
+    ) -> Result<Option<Sunk>> {
+        let [child] = children else {
+            return Ok(None);
+        };
+        let any = parent.as_any();
+        let (skip, fetch) = if let Some(local) = any.downcast_ref::<LocalLimitExec>() {
+            (0, Some(local.fetch()))
+        } else if let Some(global) = any.downcast_ref::<GlobalLimitExec>() {
+            // A global limit counts over all rows, so it needs one partition.
+            if child.output_partitioning().partition_count() != 1 {
+                return Ok(None);
+            }
+            (global.skip(), global.fetch())
+        } else {
+            return Ok(None);
+        };
+        let nd = NdLimitExec::try_new_with_registry(child.clone(), skip, fetch, registry.clone())?;
         Ok(Some(Sunk {
             nd: Arc::new(nd),
             residual: None,

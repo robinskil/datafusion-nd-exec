@@ -77,6 +77,22 @@ impl Differential {
         Ok(actual)
     }
 
+    /// Run `sql` on both paths and assert the same row count. Use it for a
+    /// query whose rows are not fixed, such as a `LIMIT` without `ORDER BY`.
+    /// Return the nd result.
+    pub async fn assert_same_row_count(&self, sql: &str) -> Result<Vec<RecordBatch>> {
+        let count = |batches: &[RecordBatch]| batches.iter().map(|b| b.num_rows()).sum::<usize>();
+        let expected = self.flat.sql(sql).await?.collect().await?;
+        let actual = self.nd.sql(sql).await?.collect().await?;
+        assert_eq!(
+            count(&actual),
+            count(&expected),
+            "the nd path and the flat path disagree on the row count for: {sql}\nnd plan:\n{}",
+            self.nd_plan(sql).await?
+        );
+        Ok(actual)
+    }
+
     /// The indented physical plan of `sql` on the nd path.
     pub async fn nd_plan(&self, sql: &str) -> Result<String> {
         let plan = self.nd.sql(sql).await?.create_physical_plan().await?;
