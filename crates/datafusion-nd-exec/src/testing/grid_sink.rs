@@ -170,24 +170,30 @@ fn build_grid(
 
 /// One output column: each output cell takes the value of the last chunk that
 /// writes it.
+///
+/// The column has the axes of the chunk where it has the most axes. A chunk
+/// where it has fewer axes, for example a scalar null for a file that lacks
+/// the column, broadcasts its values over its own block.
 fn build_column(
     index: usize,
     target: &Dimensions,
     placements: &[Placement],
 ) -> Result<NdArrowArray> {
-    let first = placements[0].batch.column(index);
-    let names: Vec<&str> = first.dims().iter().map(|d| d.name()).collect();
+    let widest = placements
+        .iter()
+        .map(|p| p.batch.column(index))
+        .max_by_key(|column| column.dims().rank())
+        .expect("at least one placement");
+    let names: Vec<&str> = widest.dims().iter().map(|d| d.name()).collect();
+    let axis_of = |name: &str| {
+        target.position(name).ok_or_else(|| {
+            DataFusionError::Execution(format!("column axis '{name}' is not an output axis"))
+        })
+    };
     let dims = Dimensions::try_new(
         names
             .iter()
-            .map(|name| {
-                let axis = target.position(name).ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "column axis '{name}' is not an output axis"
-                    ))
-                })?;
-                Ok(target.get(axis).clone())
-            })
+            .map(|name| Ok(target.get(axis_of(name)?).clone()))
             .collect::<Result<Vec<_>>>()?,
     )?;
     let strides = dims.c_strides();
@@ -195,26 +201,91 @@ fn build_column(
     // The source of each output cell: (placement, index), or the null source.
     let null_source = placements.len();
     let mut sources = vec![(null_source, 0usize); dims.num_elements()];
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(placements.len() + 1);
     for (k, placement) in placements.iter().enumerate() {
-        let column = placement.batch.column(index);
-        let chunk = column.dims();
-        let chunk_strides = chunk.c_strides();
-        for cell in 0..chunk.num_elements() {
-            let mut out = 0;
-            for (axis, name) in chunk.iter().map(|d| d.name()).enumerate() {
-                let coord = (cell / chunk_strides[axis]) % chunk.get(axis).size();
-                let offset = placement.axis(name).map_or(0, |a| a.offset);
-                let position = names.iter().position(|n| *n == name).expect("same axes");
-                out += (offset + coord) * strides[position];
-            }
+        // The block of the chunk on the column axes, in output axis order.
+        let block_axes: Vec<&crate::sink::AxisPlacement> = names
+            .iter()
+            .map(|name| {
+                placement.axis(name).ok_or_else(|| {
+                    DataFusionError::Execution(format!("the chunk has no placement for '{name}'"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let block = Dimensions::try_new(
+            block_axes
+                .iter()
+                .map(|axis| Dimension::new(axis.name.as_str(), axis.len))
+                .collect(),
+        )?;
+        arrays.push(placement.batch.column(index).materialize(&block)?);
+        let block_strides = block.c_strides();
+        for cell in 0..block.num_elements() {
+            let out: usize = block_axes
+                .iter()
+                .enumerate()
+                .map(|(axis, placed)| {
+                    let coord = (cell / block_strides[axis]) % placed.len;
+                    (placed.offset + coord) * strides[axis]
+                })
+                .sum();
             sources[out] = (k, cell);
         }
     }
-    let mut arrays: Vec<ArrayRef> = placements
-        .iter()
-        .map(|p| p.batch.column(index).values().clone())
-        .collect();
-    arrays.push(new_null_array(first.values().data_type(), 1));
+    arrays.push(new_null_array(widest.values().data_type(), 1));
     let refs: Vec<&dyn Array> = arrays.iter().map(|a| a.as_ref()).collect();
     Ok(NdArrowArray::try_new(interleave(&refs, &sources)?, dims)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::array::{AsArray, Float64Array, Int64Array};
+    use arrow::datatypes::{DataType, Field, Float64Type, Schema};
+    use nd_arrow_array::{AxisMeta, AxisOrder};
+
+    use super::*;
+
+    /// A chunk on `time` with a `sst` column, or a scalar null `sst` for a file
+    /// that lacks the column.
+    fn chunk(times: Vec<i64>, sst: Option<Vec<f64>>) -> NdRecordBatch {
+        let time = Dimension::new("time", times.len())
+            .with_meta(Some(AxisMeta::coordinate("time", AxisOrder::Ascending)));
+        let dims = Dimensions::try_new(vec![time]).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("time", DataType::Int64, true),
+            Field::new("sst", DataType::Float64, true),
+        ]));
+        let sst = match sst {
+            Some(values) => {
+                NdArrowArray::try_new(Arc::new(Float64Array::from(values)), dims.clone())
+            }
+            None => {
+                NdArrowArray::try_new(new_null_array(&DataType::Float64, 1), Dimensions::scalar())
+            }
+        }
+        .unwrap();
+        let time = NdArrowArray::try_new(Arc::new(Int64Array::from(times)), dims.clone()).unwrap();
+        NdRecordBatch::try_new(schema, vec![time, sst], dims).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_file_without_the_column_writes_nulls() {
+        let first = chunk(vec![100, 101], None);
+        let schema = first.schema().clone();
+        let sink = MemoryGridSink::new(schema);
+        let data: SendableNdBatchStream = Box::pin(futures::stream::iter(vec![
+            Ok(first),
+            Ok(chunk(vec![102], Some(vec![1.5]))),
+        ]));
+        sink.write_all(data, &Arc::new(TaskContext::default()))
+            .await
+            .unwrap();
+
+        let grid = sink.grid().unwrap();
+        let sst = grid.column(1);
+        assert_eq!(sst.dims().rank(), 1);
+        let values = sst.values().as_primitive::<Float64Type>();
+        assert!(values.is_null(0) && values.is_null(1));
+        assert_eq!(values.value(2), 1.5);
+    }
 }
