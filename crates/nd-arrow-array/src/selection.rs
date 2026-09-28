@@ -223,6 +223,141 @@ impl Selection {
         };
         Ok(result)
     }
+
+    /// The coarsest state that keeps the same cells. The selection must be
+    /// valid for `target`.
+    pub fn coarsen(&self, target: &Dimensions) -> Selection {
+        match self {
+            Selection::Full => Selection::Full,
+            Selection::AxisIndices(axes) => axis_selection(
+                axes.iter()
+                    .enumerate()
+                    .map(|(axis, indices)| {
+                        indices
+                            .as_ref()
+                            .filter(|i| i.len() != target.get(axis).size())
+                            .cloned()
+                    })
+                    .collect(),
+            ),
+            Selection::Ragged { lengths } => {
+                let rank = target.rank();
+                let inner = target.get(rank - 1).size() as u64;
+                match lengths.values().first() {
+                    // Equal lengths keep a rectangle: a prefix of the inner axis.
+                    Some(&len) if lengths.values().iter().all(|&l| l == len) => {
+                        let mut axes = vec![None; rank];
+                        if len != inner {
+                            axes[rank - 1] = Some(UInt64Array::from_iter_values(0..len));
+                        }
+                        axis_selection(axes)
+                    }
+                    _ => self.clone(),
+                }
+            }
+            Selection::CellMask(cells) => coarsen_cells(cells, target),
+        }
+    }
+
+    /// The retained cells `[offset, offset + len)` in row-major order, in the
+    /// coarsest state that holds them. A cut on outer-axis boundaries keeps a
+    /// rectangle.
+    pub fn slice(&self, target: &Dimensions, offset: usize, len: usize) -> Selection {
+        let rows = self.num_rows(target);
+        let start = offset.min(rows);
+        let end = offset.saturating_add(len).min(rows);
+        if start == 0 && end == rows {
+            return self.clone();
+        }
+        let cells = match self {
+            Selection::Full => UInt64Array::from_iter_values(start as u64..end as u64),
+            other => other.cell_indices(target).slice(start, end - start),
+        };
+        coarsen_cells(&cells, target)
+    }
+}
+
+/// `Full` when no axis is constrained, else `AxisIndices`.
+fn axis_selection(axes: Vec<Option<UInt64Array>>) -> Selection {
+    if axes.iter().all(Option::is_none) {
+        Selection::Full
+    } else {
+        Selection::AxisIndices(axes)
+    }
+}
+
+/// The coarsest state for a strictly ascending cell set.
+fn coarsen_cells(cells: &UInt64Array, target: &Dimensions) -> Selection {
+    let total = target.num_elements();
+    if cells.len() == total {
+        return Selection::Full;
+    }
+    let rank = target.rank();
+    if rank == 0 {
+        return Selection::CellMask(cells.clone());
+    }
+    if let Some(rectangle) = as_rectangle(cells, target) {
+        return rectangle;
+    }
+    if let Some(lengths) = as_ragged(cells, target) {
+        return Selection::Ragged { lengths };
+    }
+    Selection::CellMask(cells.clone())
+}
+
+/// The cells as axis index sets, when they are the cross product of those
+/// sets.
+fn as_rectangle(cells: &UInt64Array, target: &Dimensions) -> Option<Selection> {
+    let shape = target.shape();
+    let strides = target.c_strides();
+    let mut seen: Vec<Vec<bool>> = shape.iter().map(|&size| vec![false; size]).collect();
+    for &cell in cells.values() {
+        for (axis, (&stride, &size)) in strides.iter().zip(&shape).enumerate() {
+            seen[axis][(cell as usize / stride) % size] = true;
+        }
+    }
+    let sets: Vec<Vec<u64>> = seen
+        .iter()
+        .map(|axis| {
+            axis.iter()
+                .enumerate()
+                .filter(|(_, kept)| **kept)
+                .map(|(i, _)| i as u64)
+                .collect()
+        })
+        .collect();
+    // The cells are unique and inside the product, so equal counts mean equal sets.
+    if sets.iter().map(Vec::len).product::<usize>() != cells.len() {
+        return None;
+    }
+    let axes = sets
+        .into_iter()
+        .zip(&shape)
+        .map(|(set, &size)| (set.len() != size).then(|| UInt64Array::from(set)))
+        .collect::<Vec<_>>();
+    if cells.is_empty() {
+        // An empty set: constrain the outer axis to no index.
+        let mut axes = vec![None; shape.len()];
+        axes[0] = Some(UInt64Array::from(Vec::<u64>::new()));
+        return Some(Selection::AxisIndices(axes));
+    }
+    Some(axis_selection(axes))
+}
+
+/// The prefix length of the innermost axis for each outer cell, when the
+/// cells are such prefixes.
+fn as_ragged(cells: &UInt64Array, target: &Dimensions) -> Option<UInt64Array> {
+    let (outer, inner) = split_innermost(target)?;
+    let inner = inner as u64;
+    let mut lengths = vec![0u64; outer];
+    for &cell in cells.values() {
+        let (o, pos) = ((cell / inner) as usize, cell % inner);
+        if pos != lengths[o] {
+            return None;
+        }
+        lengths[o] += 1;
+    }
+    Some(UInt64Array::from(lengths))
 }
 
 /// Split `target` into the number of outer cells and the innermost axis size.
@@ -462,6 +597,115 @@ mod tests {
         let s = Selection::along_axis(&grid(), 0, u64s(&[])).unwrap();
         assert_eq!(s.num_rows(&grid()), 0);
         assert!(cells(&s, &grid()).is_empty());
+    }
+
+    fn mask(cells: &[u64]) -> Selection {
+        Selection::CellMask(u64s(cells))
+    }
+
+    #[test]
+    fn a_mask_of_every_cell_coarsens_to_full() {
+        assert_eq!(mask(&[0, 1, 2, 3, 4, 5]).coarsen(&grid()), Selection::Full);
+    }
+
+    #[test]
+    fn a_rectangular_mask_coarsens_to_axis_indices() {
+        // time 1, lat {0, 2}.
+        assert_eq!(
+            mask(&[3, 5]).coarsen(&grid()),
+            axis_selection(vec![Some(&[1]), Some(&[0, 2])])
+        );
+        // lat {1} over all time steps.
+        assert_eq!(
+            mask(&[1, 4]).coarsen(&grid()),
+            axis_selection(vec![None, Some(&[1])])
+        );
+    }
+
+    #[test]
+    fn a_prefix_mask_coarsens_to_ragged() {
+        let profiles = dims(&[("N_PROF", 3), ("N_LEVELS", 4)]);
+        assert_eq!(
+            mask(&[0, 1, 8, 9, 10]).coarsen(&profiles),
+            Selection::Ragged {
+                lengths: u64s(&[2, 0, 3])
+            }
+        );
+    }
+
+    #[test]
+    fn other_masks_stay_masks() {
+        let s = mask(&[0, 4]);
+        assert_eq!(s.coarsen(&grid()), s);
+    }
+
+    #[test]
+    fn an_empty_mask_coarsens_to_an_empty_rectangle() {
+        let s = mask(&[]).coarsen(&grid());
+        assert!(s.is_rectangle());
+        assert_eq!(s.num_rows(&grid()), 0);
+    }
+
+    #[test]
+    fn axis_indices_with_every_index_coarsen_to_full() {
+        let s = axis_selection(vec![Some(&[0, 1]), None]);
+        assert_eq!(s.coarsen(&grid()), Selection::Full);
+        let s = axis_selection(vec![Some(&[0, 1]), Some(&[2])]);
+        assert_eq!(s.coarsen(&grid()), axis_selection(vec![None, Some(&[2])]));
+    }
+
+    #[test]
+    fn equal_ragged_lengths_coarsen_to_a_rectangle() {
+        let profiles = dims(&[("N_PROF", 2), ("N_LEVELS", 4)]);
+        let s = Selection::Ragged {
+            lengths: u64s(&[2, 2]),
+        };
+        assert_eq!(
+            s.coarsen(&profiles),
+            axis_selection(vec![None, Some(&[0, 1])])
+        );
+        let s = Selection::Ragged {
+            lengths: u64s(&[4, 4]),
+        };
+        assert_eq!(s.coarsen(&profiles), Selection::Full);
+    }
+
+    #[test]
+    fn a_slice_on_outer_boundaries_keeps_a_rectangle() {
+        // The second time step: cells 3, 4, 5.
+        assert_eq!(
+            Selection::Full.slice(&grid(), 3, 3),
+            axis_selection(vec![Some(&[1]), None])
+        );
+    }
+
+    #[test]
+    fn a_slice_inside_an_outer_cell_is_ragged_or_a_mask() {
+        // Cells 0..4: time 0 in full, time 1 at lat 0. A prefix per time step.
+        assert_eq!(
+            Selection::Full.slice(&grid(), 0, 4),
+            Selection::Ragged {
+                lengths: u64s(&[3, 1])
+            }
+        );
+        // Cells 1, 2: a rectangle.
+        assert_eq!(
+            Selection::Full.slice(&grid(), 1, 2),
+            axis_selection(vec![Some(&[0]), Some(&[1, 2])])
+        );
+        // Cells 2, 3: no coarser state.
+        assert_eq!(Selection::Full.slice(&grid(), 2, 2), mask(&[2, 3]));
+    }
+
+    #[test]
+    fn a_slice_follows_the_retained_cells() {
+        // Keep lat {0, 2}: cells 0, 2, 3, 5. Skip one, take two: 2, 3.
+        let s = axis_selection(vec![None, Some(&[0, 2])]);
+        assert_eq!(s.slice(&grid(), 1, 2), mask(&[2, 3]));
+        // Past the end: no rows.
+        assert_eq!(s.slice(&grid(), 10, 2).num_rows(&grid()), 0);
+        // All rows: the selection does not change.
+        assert_eq!(s.slice(&grid(), 0, 100), s);
     }
 
     #[test]
