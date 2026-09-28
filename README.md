@@ -36,3 +36,7 @@ and `NdNodeRegistry::with_sinker`.
 ```bash
 cargo test --workspace --all-features
 ```
+
+## License
+
+AGPL-3.0. See [LICENSE](LICENSE).
