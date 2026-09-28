@@ -33,7 +33,7 @@ use arrow_schema::extension::ExtensionType;
 use super::array::NdArrowArray;
 use super::batch::NdRecordBatch;
 use super::dimensions::{Dimension, Dimensions};
-use super::extension::NdArrayType;
+use super::extension::{NdArrayMetadata, NdArrayType};
 
 /// Arrow extension type name tagged on an nd column's field.
 pub const ND_EXTENSION_NAME: &str = NdArrayType::NAME;
@@ -80,9 +80,26 @@ pub fn nd_encoded_field(name: &str, value_type: &DataType) -> Field {
 /// A scan's target schema is the *encoded* one, and the GeoArrow keys of a
 /// geometry column live in that metadata.
 pub fn nd_encoded_field_of(field: &Field) -> Field {
+    nd_encoded_field_with_dims(field, &Dimensions::scalar())
+}
+
+/// Like [`nd_encoded_field_of`], but the extension metadata also records the
+/// [`AxisMeta`](crate::AxisMeta) of each axis in `dims` that has it.
+pub fn nd_encoded_field_with_dims(field: &Field, dims: &Dimensions) -> Field {
+    let ext =
+        NdArrayType::with_metadata(field.data_type().clone(), NdArrayMetadata::from_dims(dims));
     Field::new(field.name(), nd_encoded_type(field.data_type()), true)
         .with_metadata(field.metadata().clone())
-        .with_extension_type(NdArrayType::new(field.data_type().clone()))
+        .with_extension_type(ext)
+}
+
+/// The extension metadata of an nd-encoded field, or `None` when the field is
+/// not nd-encoded.
+pub fn nd_field_metadata(field: &Field) -> Option<NdArrayMetadata> {
+    field
+        .try_extension_type::<NdArrayType>()
+        .ok()
+        .map(|ext| ext.metadata().clone())
 }
 
 /// The nd-encoded schema of a logical schema: every field becomes an nd
@@ -222,7 +239,12 @@ pub fn encode_nd_record_batch(batch: &NdRecordBatch) -> Result<RecordBatch> {
         .fields()
         .iter()
         .zip(batch.columns())
-        .map(|(field, column)| nd_encoded_field(field.name(), column.data_type()))
+        .map(|(field, column)| {
+            nd_encoded_field_with_dims(
+                &Field::new(field.name(), column.data_type().clone(), true),
+                column.dims(),
+            )
+        })
         .collect();
 
     let columns: Vec<ArrayRef> = batch.columns().iter().map(encode_nd_array).collect();
@@ -310,7 +332,17 @@ pub fn decode_nd_record_batch_row(batch: &RecordBatch, row: usize) -> Result<NdR
     let columns = batch
         .columns()
         .iter()
-        .map(|column| decode_nd_array(column, row))
+        .zip(batch.schema_ref().fields())
+        .map(|(column, field)| {
+            let array = decode_nd_array(column, row)?;
+            match nd_field_metadata(field) {
+                Some(metadata) if !metadata.axes.is_empty() => {
+                    let dims = array.dims().with_axis_meta(|name| metadata.axis_meta(name));
+                    NdArrowArray::try_new(array.values().clone(), dims)
+                }
+                _ => Ok(array),
+            }
+        })
         .collect::<Result<Vec<_>>>()?;
 
     let target = infer_target(&columns)?;
@@ -404,6 +436,41 @@ mod tests {
             encoded.metadata().get("crs").map(String::as_str),
             Some("EPSG:4326")
         );
+    }
+
+    #[test]
+    fn axis_meta_survives_the_record_batch_encoding() {
+        use crate::axis::{AxisMeta, AxisOrder};
+
+        let time_dim = Dimension::new("time", 2)
+            .with_meta(Some(AxisMeta::coordinate("time", AxisOrder::Descending)));
+        let lat_dim = Dimension::new("lat", 3);
+        let grid = Dimensions::try_new(vec![time_dim.clone(), lat_dim.clone()]).unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("time", DataType::Int32, true),
+            Field::new("sst", DataType::Float64, true),
+        ]));
+        let time = NdArrowArray::try_new(
+            Arc::new(Int32Array::from(vec![8, 7])),
+            Dimensions::try_new(vec![time_dim]).unwrap(),
+        )
+        .unwrap();
+        let sst = NdArrowArray::try_new(
+            Arc::new(Float64Array::from(vec![0.0, 0.1, 0.2, 1.0, 1.1, 1.2])),
+            grid.clone(),
+        )
+        .unwrap();
+        let nd = NdRecordBatch::try_new(schema, vec![time, sst], grid.clone()).unwrap();
+
+        let decoded = decode_nd_record_batch(&encode_nd_record_batch(&nd).unwrap()).unwrap();
+        assert_eq!(decoded.target(), &grid);
+        assert_eq!(decoded.target().get(0).order(), AxisOrder::Descending);
+        assert_eq!(
+            decoded.column(0).dims().get(0).order(),
+            AxisOrder::Descending
+        );
+        assert_eq!(decoded.target().get(1).meta(), None);
     }
 
     #[test]

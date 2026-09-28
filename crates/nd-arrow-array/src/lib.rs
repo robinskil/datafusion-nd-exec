@@ -7,6 +7,7 @@
 //! through plain Arrow operators.
 
 pub mod array;
+pub mod axis;
 pub mod batch;
 pub mod broadcast;
 pub mod dimensions;
@@ -15,6 +16,7 @@ pub mod error;
 pub mod extension;
 
 pub use array::NdArrowArray;
+pub use axis::{AxisMeta, AxisOrder};
 pub use batch::NdRecordBatch;
 pub use broadcast::BroadcastMap;
 pub use dimensions::{Dimension, Dimensions};

@@ -7,14 +7,16 @@
 use std::fmt;
 use std::sync::Arc;
 
+use crate::axis::{AxisMeta, AxisOrder};
 use crate::error::Result;
 use crate::error::nd_err;
 
-/// A single named axis with a fixed size.
+/// A single named axis with a fixed size and optional [`AxisMeta`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dimension {
     name: Arc<str>,
     size: usize,
+    meta: Option<AxisMeta>,
 }
 
 impl Dimension {
@@ -22,7 +24,26 @@ impl Dimension {
         Self {
             name: name.into(),
             size,
+            meta: None,
         }
+    }
+
+    /// Attach (or clear) the coordinate and order metadata of the axis.
+    pub fn with_meta(mut self, meta: Option<AxisMeta>) -> Self {
+        self.meta = meta;
+        self
+    }
+
+    pub fn meta(&self) -> Option<&AxisMeta> {
+        self.meta.as_ref()
+    }
+
+    /// The monotone direction of the axis coordinate. An axis without
+    /// metadata is [`AxisOrder::Unordered`].
+    pub fn order(&self) -> AxisOrder {
+        self.meta
+            .as_ref()
+            .map_or(AxisOrder::Unordered, AxisMeta::order)
     }
 
     pub fn name(&self) -> &str {
@@ -92,6 +113,20 @@ impl Dimensions {
         self.dims.iter().position(|d| d.name() == name)
     }
 
+    /// A copy with the metadata of each axis replaced by `meta(name)`. An axis
+    /// for which `meta` returns `None` keeps its current metadata.
+    pub fn with_axis_meta(&self, meta: impl Fn(&str) -> Option<AxisMeta>) -> Self {
+        let dims: Vec<Dimension> = self
+            .dims
+            .iter()
+            .map(|dim| match meta(dim.name()) {
+                Some(m) => dim.clone().with_meta(Some(m)),
+                None => dim.clone(),
+            })
+            .collect();
+        Self { dims: dims.into() }
+    }
+
     /// C-order (row-major) strides, in elements.
     pub fn c_strides(&self) -> Vec<usize> {
         let mut strides = vec![0usize; self.rank()];
@@ -149,6 +184,18 @@ mod tests {
     fn duplicate_names_rejected() {
         let result = Dimensions::try_new(vec![Dimension::new("x", 2), Dimension::new("x", 3)]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn axis_meta_is_optional() {
+        let plain = Dimension::new("N_PROF", 3);
+        assert_eq!(plain.meta(), None);
+        assert_eq!(plain.order(), AxisOrder::Unordered);
+
+        let time = Dimension::new("time", 2)
+            .with_meta(Some(AxisMeta::coordinate("time", AxisOrder::Ascending)));
+        assert_eq!(time.order(), AxisOrder::Ascending);
+        assert_eq!(time.meta().unwrap().coordinate_column(), Some("time"));
     }
 
     #[test]
