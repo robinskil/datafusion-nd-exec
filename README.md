@@ -41,8 +41,22 @@ and `NdNodeRegistry::with_sinker`.
 | `NdUnionExec` | `UnionExec` |
 | `NdLimitExec` | `LocalLimitExec`, `GlobalLimitExec` |
 | `NdRepartitionExec` | round-robin `RepartitionExec` |
-| `NdEmptyExec`, `NdAxisReorderExec` | none: building blocks for sinks |
+| `NdCoalescePartitionsExec` | `CoalescePartitionsExec` |
+| `NdEmptyExec`, `NdAxisReorderExec`, `NdCoarsenExec` | none: building blocks that a host plans |
 | `NdBroadcastExec` | the boundary to flat rows |
+
+## Output terminals
+
+A terminal ends the nd region instead of `NdBroadcastExec`, so the grid
+reaches the output.
+
+| Terminal | Use |
+|---|---|
+| `NdDataSinkExec` | Write the grid with an `NdDataSink`. It replaces a `DataSinkExec` when an `NdSinkFactory` of the registry maps its sink. |
+| `NdEncodeExec` | Yield one `nd.array`-encoded row per chunk, for Arrow IPC or Flight. `nd_output_plan` puts it at the root. |
+
+A grid writer places each chunk with the `NdGridAccumulator`. Its axis modes
+are `Coordinate`, `Append`, `Pad` and `Fixed`.
 
 ## Test
 

@@ -85,3 +85,11 @@ Axis modes:
 6. `NdCoarsenExec`.
 
 Each step is one commit with its tests. Verification per step: `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test --workspace --all-features`.
+
+## Changes during implementation
+
+- All chunks must have the same set of axes. A chunk that adds or lacks an output axis is an error: the accumulator cannot place it without a guess.
+- The accumulator and the sink terminal are in a new `sink` module of `datafusion-nd-exec`. The accumulator compares coordinate values with the Arrow row format, so it needs no DataFusion scalar type.
+- `NdEncodeExec` keeps the partitions of its input. A host merges the flat encoded batches with the usual DataFusion nodes.
+- `Min` and `Max` of `NdCoarsenExec` compute in `Float64` and cast back to the column type. An integer above 2^53 can lose precision.
+- `selection::cartesian_sum` in `nd-arrow-array` is public, for the block walk of the coarsen node.
