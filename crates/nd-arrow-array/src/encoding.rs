@@ -5,11 +5,17 @@
 //!
 //! ```text
 //! Struct{
-//!   values:    List<T>,       // the flat, C-order values (one list element)
-//!   dim_sizes: List<UInt32>,  // size per axis
-//!   dim_names: List<Utf8>,    // name per axis
+//!   values:     List<T>,       // the flat, C-order values (one list element)
+//!   dim_sizes:  List<UInt32>,  // size per axis
+//!   dim_names:  List<Utf8>,    // name per axis
+//!   grid_sizes: List<UInt32>,  // size per axis of the batch grid, or null
+//!   grid_names: List<Utf8>,    // name per axis of the batch grid, or null
 //! }
 //! ```
+//!
+//! Each column of an encoded batch records the grid of the batch. A scan that
+//! projects away every column on an axis still keeps that axis in the grid,
+//! so the row count of the scan does not change.
 //!
 //! The struct field carries the registered [`NdArrayType`] extension type, so
 //! the intent survives IPC. Because it is an ordinary Arrow array, an nd batch encoded
@@ -24,7 +30,7 @@ use crate::error::{ArrowError, Result};
 use arrow::array::{
     Array, ArrayRef, ListArray, StringArray, StructArray, UInt32Array, new_null_array,
 };
-use arrow::buffer::OffsetBuffer;
+use arrow::buffer::{NullBuffer, OffsetBuffer};
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
@@ -42,25 +48,50 @@ fn err(e: impl std::fmt::Display) -> ArrowError {
     ArrowError::InvalidArgumentError(e.to_string())
 }
 
-/// The three struct fields of the nd encoding for a given element type.
+/// The struct fields of the nd encoding for a given element type.
 fn nd_struct_fields(value_type: &DataType) -> Fields {
+    let sizes = || DataType::List(Arc::new(Field::new("item", DataType::UInt32, false)));
+    let names = || DataType::List(Arc::new(Field::new("item", DataType::Utf8, false)));
     Fields::from(vec![
         Field::new(
             "values",
             DataType::List(Arc::new(Field::new("item", value_type.clone(), true))),
             false,
         ),
-        Field::new(
-            "dim_sizes",
-            DataType::List(Arc::new(Field::new("item", DataType::UInt32, false))),
-            false,
-        ),
-        Field::new(
-            "dim_names",
-            DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
-            false,
-        ),
+        Field::new("dim_sizes", sizes(), false),
+        Field::new("dim_names", names(), false),
+        Field::new("grid_sizes", sizes(), true),
+        Field::new("grid_names", names(), true),
     ])
+}
+
+/// One-row `List<UInt32>` and `List<Utf8>` arrays of the sizes and names of
+/// `dims`. `None` gives a null row in both.
+fn dims_lists(dims: Option<&Dimensions>) -> (ListArray, ListArray) {
+    let nulls = dims.is_none().then(|| NullBuffer::new_null(1));
+    let rank = dims.map_or(0, Dimensions::rank);
+    let sizes: UInt32Array = dims
+        .into_iter()
+        .flat_map(|d| d.iter().map(|d| d.size() as u32))
+        .collect();
+    let names: StringArray = dims
+        .into_iter()
+        .flat_map(|d| d.iter().map(|d| Some(d.name().to_string())))
+        .collect();
+    (
+        ListArray::new(
+            Arc::new(Field::new("item", DataType::UInt32, false)),
+            OffsetBuffer::from_lengths([rank]),
+            Arc::new(sizes),
+            nulls.clone(),
+        ),
+        ListArray::new(
+            Arc::new(Field::new("item", DataType::Utf8, false)),
+            OffsetBuffer::from_lengths([rank]),
+            Arc::new(names),
+            nulls,
+        ),
+    )
 }
 
 /// The struct `DataType` of the nd encoding for a given element type.
@@ -137,38 +168,30 @@ pub fn nd_value_type(encoded: &DataType) -> Result<DataType> {
 
 /// Encode one [`NdArrowArray`] as a single-row `Struct` array.
 pub fn encode_nd_array(array: &NdArrowArray) -> ArrayRef {
-    let values = array.values();
-    let dims = array.dims();
+    encode_nd_array_on_grid(array, None)
+}
 
+/// Encode one [`NdArrowArray`] as a single-row `Struct` array that also
+/// records `grid`, the target grid of its batch.
+pub fn encode_nd_array_on_grid(array: &NdArrowArray, grid: Option<&Dimensions>) -> ArrayRef {
+    let values = array.values();
     let values_list = ListArray::new(
         Arc::new(Field::new("item", values.data_type().clone(), true)),
         OffsetBuffer::from_lengths([values.len()]),
         values.clone(),
         None,
     );
-
-    let sizes: UInt32Array = dims.iter().map(|d| d.size() as u32).collect();
-    let dim_sizes_list = ListArray::new(
-        Arc::new(Field::new("item", DataType::UInt32, false)),
-        OffsetBuffer::from_lengths([dims.rank()]),
-        Arc::new(sizes),
-        None,
-    );
-
-    let names: StringArray = dims.iter().map(|d| Some(d.name().to_string())).collect();
-    let dim_names_list = ListArray::new(
-        Arc::new(Field::new("item", DataType::Utf8, false)),
-        OffsetBuffer::from_lengths([dims.rank()]),
-        Arc::new(names),
-        None,
-    );
+    let (dim_sizes, dim_names) = dims_lists(Some(array.dims()));
+    let (grid_sizes, grid_names) = dims_lists(grid);
 
     let struct_array = StructArray::new(
         nd_struct_fields(values.data_type()),
         vec![
             Arc::new(values_list),
-            Arc::new(dim_sizes_list),
-            Arc::new(dim_names_list),
+            Arc::new(dim_sizes),
+            Arc::new(dim_names),
+            Arc::new(grid_sizes),
+            Arc::new(grid_names),
         ],
         None,
     );
@@ -180,55 +203,81 @@ pub fn encode_nd_array(array: &NdArrowArray) -> ArrayRef {
 /// A null struct row (a column a file lacked, null-filled by the schema adapter)
 /// decodes to a rank-0 null scalar, which broadcasts to an all-null column.
 pub fn decode_nd_array(column: &ArrayRef, row: usize) -> Result<NdArrowArray> {
-    let structs = column
-        .as_any()
-        .downcast_ref::<StructArray>()
-        .ok_or_else(|| err("nd column is not a Struct array"))?;
+    let structs = as_struct(column)?;
 
     if structs.is_null(row) {
         let value_type = nd_value_type(structs.data_type())?;
         return NdArrowArray::try_new(new_null_array(&value_type, 1), Dimensions::scalar());
     }
 
-    let list_at = |name: &str| -> Result<ArrayRef> {
-        let list = structs
-            .column_by_name(name)
-            .ok_or_else(|| err(format!("nd struct is missing field '{name}'")))?
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .ok_or_else(|| err(format!("nd struct field '{name}' is not a List")))?;
-        Ok(list.value(row))
+    let values =
+        list_value(structs, "values", row)?.ok_or_else(|| err("nd 'values' must not be null"))?;
+    let dims = decode_dims(structs, "dim_sizes", "dim_names", row)?
+        .ok_or_else(|| err("nd dimensions must not be null"))?;
+    NdArrowArray::try_new(values, dims)
+}
+
+/// Decode the batch grid that row `row` of an nd-encoded column records, or
+/// `None` when the row records no grid.
+pub fn decode_nd_grid(column: &ArrayRef, row: usize) -> Result<Option<Dimensions>> {
+    let structs = as_struct(column)?;
+    if structs.is_null(row) || structs.column_by_name("grid_sizes").is_none() {
+        return Ok(None);
+    }
+    decode_dims(structs, "grid_sizes", "grid_names", row)
+}
+
+fn as_struct(column: &ArrayRef) -> Result<&StructArray> {
+    column
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| err("nd column is not a Struct array"))
+}
+
+/// The list value of field `name` at `row`, or `None` for a null list.
+fn list_value(structs: &StructArray, name: &str, row: usize) -> Result<Option<ArrayRef>> {
+    let list = structs
+        .column_by_name(name)
+        .ok_or_else(|| err(format!("nd struct is missing field '{name}'")))?
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| err(format!("nd struct field '{name}' is not a List")))?;
+    Ok(list.is_valid(row).then(|| list.value(row)))
+}
+
+fn decode_dims(
+    structs: &StructArray,
+    sizes_field: &str,
+    names_field: &str,
+    row: usize,
+) -> Result<Option<Dimensions>> {
+    let (Some(sizes), Some(names)) = (
+        list_value(structs, sizes_field, row)?,
+        list_value(structs, names_field, row)?,
+    ) else {
+        return Ok(None);
     };
-
-    let values = list_at("values")?;
-
-    let sizes = list_at("dim_sizes")?;
     let sizes = sizes
         .as_any()
         .downcast_ref::<UInt32Array>()
-        .ok_or_else(|| err("nd 'dim_sizes' is not UInt32"))?;
-
-    let names = list_at("dim_names")?;
+        .ok_or_else(|| err(format!("nd '{sizes_field}' is not UInt32")))?;
     let names = names
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| err("nd 'dim_names' is not Utf8"))?;
-
+        .ok_or_else(|| err(format!("nd '{names_field}' is not Utf8")))?;
     if sizes.len() != names.len() {
         return nd_err!(
-            "nd dim_sizes ({}) and dim_names ({}) disagree",
+            "nd {sizes_field} ({}) and {names_field} ({}) disagree",
             sizes.len(),
             names.len()
         );
     }
-
     let dims = Dimensions::try_new(
         (0..sizes.len())
             .map(|i| Dimension::new(names.value(i), sizes.value(i) as usize))
             .collect(),
     )?;
-
-    NdArrowArray::try_new(values, dims)
+    Ok(Some(dims))
 }
 
 /// Encode an [`NdRecordBatch`] as a flat `RecordBatch` of nd-encoded (`nd.array`)
@@ -247,7 +296,11 @@ pub fn encode_nd_record_batch(batch: &NdRecordBatch) -> Result<RecordBatch> {
         })
         .collect();
 
-    let columns: Vec<ArrayRef> = batch.columns().iter().map(encode_nd_array).collect();
+    let columns: Vec<ArrayRef> = batch
+        .columns()
+        .iter()
+        .map(|column| encode_nd_array_on_grid(column, Some(batch.target())))
+        .collect();
 
     let options = RecordBatchOptions::new().with_row_count(Some(1));
     RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), columns, &options)
@@ -319,7 +372,8 @@ pub fn nd_batch_count(batch: &RecordBatch) -> usize {
 }
 
 /// Decode a single row of an nd-encoded `RecordBatch` into an [`NdRecordBatch`].
-/// The target grid is inferred as the union of the columns' dimensions, ordered
+/// The target grid is the grid that the columns record. When no column
+/// records a grid, the target is the union of the columns' dimensions, ordered
 /// by the highest-rank column.
 pub fn decode_nd_record_batch_row(batch: &RecordBatch, row: usize) -> Result<NdRecordBatch> {
     // A zero-column batch is a COUNT(*)-style row carrier: preserve its row
@@ -345,9 +399,39 @@ pub fn decode_nd_record_batch_row(batch: &RecordBatch, row: usize) -> Result<NdR
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let target = infer_target(&columns)?;
+    let target = match recorded_grid(batch, row)? {
+        Some(grid) => {
+            let metadata: Vec<NdArrayMetadata> = batch
+                .schema_ref()
+                .fields()
+                .iter()
+                .filter_map(|field| nd_field_metadata(field))
+                .collect();
+            grid.with_axis_meta(|name| metadata.iter().find_map(|m| m.axis_meta(name)))
+        }
+        None => infer_target(&columns)?,
+    };
     let schema = logical_schema(batch.schema_ref())?;
     NdRecordBatch::try_new(schema, columns, target)
+}
+
+/// The grid that the columns of row `row` record. All columns that record a
+/// grid must agree.
+fn recorded_grid(batch: &RecordBatch, row: usize) -> Result<Option<Dimensions>> {
+    let mut grid: Option<Dimensions> = None;
+    for column in batch.columns() {
+        let Some(recorded) = decode_nd_grid(column, row)? else {
+            continue;
+        };
+        match &grid {
+            Some(grid) if grid != &recorded => {
+                return nd_err!("nd columns record different grids: {grid} and {recorded}");
+            }
+            Some(_) => {}
+            None => grid = Some(recorded),
+        }
+    }
+    Ok(grid)
 }
 
 /// Infer the target grid from decoded columns: the highest-rank column defines
@@ -471,6 +555,40 @@ mod tests {
             AxisOrder::Descending
         );
         assert_eq!(decoded.target().get(1).meta(), None);
+    }
+
+    #[test]
+    fn a_projected_batch_keeps_the_full_grid() {
+        // Drop every column on `time`: the grid still has the `time` axis.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("sst", DataType::Float64, true),
+            Field::new("elev", DataType::Int32, true),
+        ]));
+        let grid = dims(&[("time", 2), ("lat", 3)]);
+        let sst = NdArrowArray::try_new(
+            Arc::new(Float64Array::from(vec![0.0, 0.1, 0.2, 1.0, 1.1, 1.2])),
+            grid.clone(),
+        )
+        .unwrap();
+        let elev = NdArrowArray::try_new(
+            Arc::new(Int32Array::from(vec![5, 10, 15])),
+            dims(&[("lat", 3)]),
+        )
+        .unwrap();
+        let nd = NdRecordBatch::try_new(schema, vec![sst, elev], grid.clone()).unwrap();
+        let encoded = encode_nd_record_batch(&nd).unwrap();
+
+        let projected = encoded.project(&[1]).unwrap();
+        let decoded = decode_nd_record_batch(&projected).unwrap();
+        assert_eq!(decoded.target(), &grid);
+        assert_eq!(decoded.num_rows(), 6);
+    }
+
+    #[test]
+    fn a_lone_array_records_no_grid() {
+        let a = NdArrowArray::try_new(Arc::new(Int32Array::from(vec![1, 2])), dims(&[("lat", 2)]))
+            .unwrap();
+        assert_eq!(decode_nd_grid(&encode_nd_array(&a), 0).unwrap(), None);
     }
 
     #[test]
