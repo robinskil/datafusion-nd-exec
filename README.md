@@ -55,8 +55,10 @@ reaches the output.
 | `NdDataSinkExec` | Write the grid with an `NdDataSink`. It replaces a `DataSinkExec` when an `NdSinkFactory` of the registry maps its sink. |
 | `NdEncodeExec` | Yield one `nd.array`-encoded row per chunk, for Arrow IPC or Flight. `nd_output_plan` puts it at the root. |
 
-A grid writer places each chunk with the `NdGridAccumulator`. Its axis modes
-are `Coordinate`, `Append`, `Pad` and `Fixed`.
+A grid writer places each chunk with the `NdGridAccumulator`. One axis grows
+(`Coordinate` or `Append`); the other axes match (`Coordinate` or `Fixed`) or
+pad (`Pad`). A host that knows a coordinate up front seeds it with
+`with_coordinate`, so the output axis is sorted whatever the chunk order.
 
 ## Test
 

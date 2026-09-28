@@ -24,6 +24,8 @@ use crate::sink::{AxisMode, NdDataSink, NdGridAccumulator, Placement};
 pub struct MemoryGridSink {
     schema: SchemaRef,
     modes: Vec<(String, AxisMode)>,
+    growth_axis: Option<String>,
+    seeds: Vec<(String, ArrayRef)>,
     grid: Mutex<Option<NdRecordBatch>>,
 }
 
@@ -32,6 +34,8 @@ impl MemoryGridSink {
         Self {
             schema,
             modes: Vec::new(),
+            growth_axis: None,
+            seeds: Vec::new(),
             grid: Mutex::new(None),
         }
     }
@@ -40,6 +44,33 @@ impl MemoryGridSink {
     pub fn with_mode(mut self, axis: impl Into<String>, mode: AxisMode) -> Self {
         self.modes.push((axis.into(), mode));
         self
+    }
+
+    /// Set the growth axis of the accumulator.
+    pub fn with_growth_axis(mut self, axis: impl Into<String>) -> Self {
+        self.growth_axis = Some(axis.into());
+        self
+    }
+
+    /// Seed the coordinate of the axis `axis`, see
+    /// [`NdGridAccumulator::with_coordinate`].
+    pub fn with_coordinate(mut self, axis: impl Into<String>, values: ArrayRef) -> Self {
+        self.seeds.push((axis.into(), values));
+        self
+    }
+
+    fn accumulator(&self) -> NdGridAccumulator {
+        let mut acc = NdGridAccumulator::new();
+        for (axis, mode) in &self.modes {
+            acc = acc.with_mode(axis.clone(), *mode);
+        }
+        if let Some(axis) = &self.growth_axis {
+            acc = acc.with_growth_axis(axis.clone());
+        }
+        for (axis, values) in &self.seeds {
+            acc = acc.with_coordinate(axis.clone(), values.clone());
+        }
+        acc
     }
 
     /// The output grid of the last `write_all`.
@@ -69,12 +100,7 @@ impl NdDataSink for MemoryGridSink {
         mut data: SendableNdBatchStream,
         _context: &Arc<TaskContext>,
     ) -> Result<u64> {
-        let mut accumulator = self
-            .modes
-            .iter()
-            .fold(NdGridAccumulator::new(), |acc, (axis, mode)| {
-                acc.with_mode(axis.clone(), *mode)
-            });
+        let mut accumulator = self.accumulator();
         let mut placements = Vec::new();
         while let Some(batch) = data.next().await {
             placements.push(accumulator.place(&batch?)?);
@@ -110,8 +136,30 @@ fn build_grid(
             .map(|(name, size)| Dimension::new(name.as_str(), *size).with_meta(meta_of(name)))
             .collect(),
     )?;
-    let columns = (0..schema.fields().len())
-        .map(|index| build_column(index, &target, placements))
+    let columns = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            // A seeded coordinate comes from its seed, so a value that no
+            // chunk holds is not null.
+            let seeded = extents.iter().find_map(|(axis, _)| {
+                (accumulator.coordinate_column(axis) == Some(field.name().as_str()))
+                    .then(|| accumulator.coordinate_seed(axis).map(|seed| (axis, seed)))
+                    .flatten()
+            });
+            match seeded {
+                Some((axis, seed)) => {
+                    let dims = Dimensions::try_new(vec![
+                        target
+                            .get(target.position(axis).expect("output axis"))
+                            .clone(),
+                    ])?;
+                    Ok(NdArrowArray::try_new(seed.clone(), dims)?)
+                }
+                None => build_column(index, &target, placements),
+            }
+        })
         .collect::<Result<Vec<_>>>()?;
     Ok(Some(NdRecordBatch::try_new(
         schema.clone(),

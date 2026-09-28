@@ -93,3 +93,18 @@ Each step is one commit with its tests. Verification per step: `cargo fmt --chec
 - `NdEncodeExec` keeps the partitions of its input. A host merges the flat encoded batches with the usual DataFusion nodes.
 - `Min` and `Max` of `NdCoarsenExec` compute in `Float64` and cast back to the column type. An integer above 2^53 can lose precision.
 - `selection::cartesian_sum` in `nd-arrow-array` is public, for the block walk of the coarsen node.
+
+## Growth axis and seeds
+
+After review, the accumulator has one growth axis:
+
+| Axis | Allowed modes | Default |
+|---|---|---|
+| growth axis (the outer axis, or `with_growth_axis`) | `Coordinate`, `Append` | `Coordinate` with a coordinate column, else `Append` |
+| other axis | `Coordinate`, `Pad`, `Fixed` | `Coordinate` with a coordinate column, else `Fixed` |
+
+- `Pad` needs an axis without a coordinate column.
+- A chunk with another axis set fails. There is no grouping per grid yet.
+- An unseeded inner coordinate axis appends new values that do not overlap, so a chunk split along an inner axis works. An overlap without a match fails.
+- `with_coordinate(axis, values)` seeds an axis with its whole coordinate, for example from file metadata. The values are sorted ascending, unless they are strictly descending, and duplicates are removed. Each chunk then gets its offset by value, whatever its arrival order, and the extent is known up front. A seeded axis is strict: a value outside the seed fails. A chunk that runs against the seed order fails with its own message.
+- `coordinate_order(axis)` reports whether an unseeded coordinate axis came out ascending, descending or unordered, because its values follow the arrival order.

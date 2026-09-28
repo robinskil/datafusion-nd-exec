@@ -98,6 +98,39 @@ async fn profiles_append_and_pad_in_the_sink() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn a_seeded_growth_axis_comes_out_sorted() -> Result<()> {
+    use arrow::array::Int64Array;
+    use arrow::datatypes::Int64Type;
+
+    let table = grid_table()?;
+    let schema = table
+        .nd_scan(None, NdNodeRegistry::shared_default())?
+        .schema();
+    // The seed holds one more time step than the data.
+    let seed = Arc::new(Int64Array::from(vec![103, 104, 100, 102, 101]));
+    let sink = Arc::new(MemoryGridSink::new(schema).with_coordinate("time", seed));
+    run(Arc::new(NdDataSinkExec::try_new(
+        nd_scan(&table)?,
+        sink.clone(),
+    )?))
+    .await?;
+
+    let grid = sink.grid().unwrap();
+    let time = grid.column(0).values().as_primitive::<Int64Type>();
+    assert_eq!(time.values(), &[100, 101, 102, 103, 104]);
+    // No chunk writes time step 104, so its cells are null.
+    let sst = grid.column(3).values();
+    let per_step = 3 * 2;
+    assert_eq!(
+        (4 * per_step..5 * per_step)
+            .filter(|&i| sst.is_null(i))
+            .count(),
+        per_step
+    );
+    Ok(())
+}
+
 /// A flat sink of a host.
 #[derive(Debug)]
 struct HostSink {
