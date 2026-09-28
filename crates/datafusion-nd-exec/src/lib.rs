@@ -10,6 +10,7 @@ pub mod optimizer;
 pub mod pushdown;
 pub mod registry;
 pub mod session;
+pub mod sink;
 pub mod sinkers;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod testing;
