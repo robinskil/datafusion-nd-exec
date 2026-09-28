@@ -181,7 +181,10 @@ impl ExecutionPlan for NdBroadcastExec {
         vec![false]
     }
 
+    /// A sort must not move below this node: below it the rows are nd
+    /// batches or encoded chunks. The order still reaches the plan through the
+    /// equivalence properties.
     fn maintains_input_order(&self) -> Vec<bool> {
-        vec![true]
+        vec![false]
     }
 }

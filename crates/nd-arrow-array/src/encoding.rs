@@ -80,11 +80,15 @@ pub fn nd_encoded_field(name: &str, value_type: &DataType) -> Field {
 /// A scan's target schema is the *encoded* one, and the GeoArrow keys of a
 /// geometry column live in that metadata.
 pub fn nd_encoded_field_of(field: &Field) -> Field {
-    nd_encoded_field_with_dims(field, &Dimensions::scalar())
+    Field::new(field.name(), nd_encoded_type(field.data_type()), true)
+        .with_metadata(field.metadata().clone())
+        .with_extension_type(NdArrayType::new(field.data_type().clone()))
 }
 
 /// Like [`nd_encoded_field_of`], but the extension metadata also records the
-/// [`AxisMeta`](crate::AxisMeta) of each axis in `dims` that has it.
+/// axis names of `dims` and the [`AxisMeta`](crate::AxisMeta) of each axis
+/// that has it. A format that knows the axes of each column at plan time uses
+/// this, so the plan can derive the grid and its sort order.
 pub fn nd_encoded_field_with_dims(field: &Field, dims: &Dimensions) -> Field {
     let ext =
         NdArrayType::with_metadata(field.data_type().clone(), NdArrayMetadata::from_dims(dims));
@@ -350,6 +354,28 @@ pub fn decode_nd_record_batch_row(batch: &RecordBatch, row: usize) -> Result<NdR
     NdRecordBatch::try_new(schema, columns, target)
 }
 
+/// The axis names of the grid of a scan with the encoded schema `encoded`,
+/// outer first, from the field metadata. The rule is the rule of
+/// [`infer_target`]. `None` when a field does not record its axes.
+pub fn plan_target_axes(encoded: &Schema) -> Option<Vec<String>> {
+    let columns = encoded
+        .fields()
+        .iter()
+        .map(|field| nd_field_metadata(field)?.dims)
+        .collect::<Option<Vec<_>>>()?;
+    let mut order: Vec<String> = columns
+        .iter()
+        .max_by_key(|dims| dims.len())
+        .cloned()
+        .unwrap_or_default();
+    for name in columns.iter().flatten() {
+        if !order.contains(name) {
+            order.push(name.clone());
+        }
+    }
+    Some(order)
+}
+
 /// Infer the target grid from decoded columns: the highest-rank column defines
 /// the axis order (it spans the grid in C-order), and any axis only present on
 /// lower-rank columns is appended.
@@ -497,6 +523,30 @@ mod tests {
         let decoded = decode_nd_record_batch(&encoded.project(&[1]).unwrap()).unwrap();
         assert_eq!(decoded.target(), &dims(&[("lat", 3)]));
         assert_eq!(decoded.num_rows(), 3);
+    }
+
+    #[test]
+    fn the_plan_grid_follows_the_widest_column() {
+        let field = |name: &str, axes: &[(&str, usize)]| {
+            nd_encoded_field_with_dims(&Field::new(name, DataType::Float64, true), &dims(axes))
+        };
+        let schema = Schema::new(vec![
+            field("lat", &[("lat", 3)]),
+            field("sst", &[("time", 2), ("lat", 3)]),
+            field("depth", &[("depth", 4)]),
+        ]);
+        assert_eq!(
+            plan_target_axes(&schema),
+            Some(vec![
+                "time".to_string(),
+                "lat".to_string(),
+                "depth".to_string()
+            ])
+        );
+
+        // A field without its axes gives no plan grid.
+        let schema = Schema::new(vec![nd_encoded_field("lat", &DataType::Float64)]);
+        assert_eq!(plan_target_axes(&schema), None);
     }
 
     #[test]

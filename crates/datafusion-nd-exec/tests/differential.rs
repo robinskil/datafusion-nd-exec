@@ -31,6 +31,9 @@ const GRID_QUERIES: &[&str] = &[
     "SELECT * FROM grid WHERE random() < 2 AND lat > 0",
     "SELECT time, lat, lon FROM grid ORDER BY time DESC, lat, lon LIMIT 5",
     "SELECT * FROM grid UNION ALL SELECT * FROM grid",
+    "SELECT time, lat, lon, sst FROM grid ORDER BY time, lat, lon",
+    "SELECT time, sst FROM grid WHERE lat > 0 ORDER BY time DESC",
+    "SELECT lat * 2 AS lat2, time FROM grid ORDER BY time",
     "SELECT lat, sst FROM grid WHERE lat > 0 UNION ALL SELECT lat, sst FROM grid WHERE sst < 3",
 ];
 

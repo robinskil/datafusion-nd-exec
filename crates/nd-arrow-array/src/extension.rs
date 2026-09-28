@@ -33,6 +33,10 @@ pub struct NdArrayMetadata {
     /// Metadata of the axes that have it. Other axes are absent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub axes: Vec<AxisEntry>,
+    /// The axis names of the column, outer first, when the format knows them
+    /// at plan time. An empty list is a scalar column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dims: Option<Vec<String>>,
 }
 
 /// The serialized [`AxisMeta`] of one named axis.
@@ -46,7 +50,8 @@ pub struct AxisEntry {
 }
 
 impl NdArrayMetadata {
-    /// Metadata that records the [`AxisMeta`] of each axis in `dims`.
+    /// Metadata that records the axis names of `dims` and the [`AxisMeta`] of
+    /// each axis that has it.
     pub fn from_dims(dims: &Dimensions) -> Self {
         let axes = dims
             .iter()
@@ -61,6 +66,7 @@ impl NdArrayMetadata {
         Self {
             version: ND_ENCODING_VERSION,
             axes,
+            dims: Some(dims.iter().map(|d| d.name().to_string()).collect()),
         }
     }
 
@@ -82,6 +88,7 @@ impl Default for NdArrayMetadata {
         Self {
             version: ND_ENCODING_VERSION,
             axes: Vec::new(),
+            dims: None,
         }
     }
 }
@@ -276,6 +283,14 @@ mod tests {
             Some(AxisMeta::no_coordinate())
         );
         assert_eq!(metadata.axis_meta("lon"), None);
+        assert_eq!(
+            metadata.dims,
+            Some(vec![
+                "time".to_string(),
+                "N_PROF".to_string(),
+                "lon".to_string()
+            ])
+        );
     }
 
     #[test]

@@ -30,6 +30,7 @@ pub struct NdMemTable {
     encoded_schema: SchemaRef,
     partitions: Vec<Vec<NdRecordBatch>>,
     encoded: Vec<Vec<RecordBatch>>,
+    ordered_chunks: bool,
 }
 
 impl NdMemTable {
@@ -64,7 +65,15 @@ impl NdMemTable {
             encoded_schema,
             partitions,
             encoded,
+            ordered_chunks: false,
         })
+    }
+
+    /// Declare that each partition holds its chunks in the order of the outer
+    /// axis, see [`NdSourceExec::with_ordered_chunks`].
+    pub fn with_ordered_chunks(mut self) -> Self {
+        self.ordered_chunks = true;
+        self
     }
 
     pub fn partitions(&self) -> &[Vec<NdRecordBatch>] {
@@ -138,7 +147,12 @@ impl NdMemTable {
                 projection.cloned(),
             )?,
         };
-        let source = Arc::new(NdSourceExec::try_new(memory)?);
+        let source = NdSourceExec::try_new(memory)?;
+        let source = Arc::new(if self.ordered_chunks {
+            source.with_ordered_chunks()?
+        } else {
+            source
+        });
         Ok(Arc::new(NdBroadcastExec::try_new_with_registry(
             source, registry,
         )?))

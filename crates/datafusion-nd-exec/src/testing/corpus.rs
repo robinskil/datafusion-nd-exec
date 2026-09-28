@@ -35,7 +35,8 @@ pub fn grid_schema() -> SchemaRef {
 }
 
 /// A grid with axes `time=4, lat=3, lon=2` in two chunks of two time steps.
-/// Each chunk is its own partition.
+/// Each chunk is its own partition. The coordinates rise, so the table
+/// declares ordered chunks.
 ///
 /// | Column | Axes | Content |
 /// |---|---|---|
@@ -84,7 +85,7 @@ pub fn grid_table() -> Result<NdMemTable> {
             target,
         )?]);
     }
-    NdMemTable::try_new(partitions)
+    Ok(NdMemTable::try_new(partitions)?.with_ordered_chunks())
 }
 
 /// The schema of [`profile_table`].

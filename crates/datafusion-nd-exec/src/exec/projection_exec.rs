@@ -21,7 +21,9 @@ use std::sync::Arc;
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::projection::ProjectionMapping;
+use datafusion::physical_plan::ExecutionPlanProperties;
 use datafusion::physical_plan::metrics::{
     BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
 };
@@ -130,12 +132,16 @@ impl NdProjectionExec {
             }
             None => derived,
         };
+        let mapping = ProjectionMapping::try_new(exprs.iter().cloned(), &input_schema)?;
+        let eq_properties = input
+            .equivalence_properties()
+            .project(&mapping, schema.clone());
         let properties = Arc::new(
             input
                 .properties()
                 .as_ref()
                 .clone()
-                .with_eq_properties(EquivalenceProperties::new(schema.clone())),
+                .with_eq_properties(eq_properties),
         );
         Ok(Self {
             input,
@@ -251,8 +257,11 @@ impl ExecutionPlan for NdProjectionExec {
         vec![false]
     }
 
+    /// A sort must not move below this node: below it the rows are nd
+    /// batches or encoded chunks. The order still reaches the plan through the
+    /// equivalence properties.
     fn maintains_input_order(&self) -> Vec<bool> {
-        vec![true]
+        vec![false]
     }
 }
 
