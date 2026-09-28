@@ -4,11 +4,9 @@
 //!
 //! ```text
 //! Struct{
-//!   values:     List<T>,       // the flat, C-order values
-//!   dim_sizes:  List<UInt32>,  // size per axis
-//!   dim_names:  List<Utf8>,    // name per axis
-//!   grid_sizes: List<UInt32>,  // optional: size per axis of the batch grid
-//!   grid_names: List<Utf8>,    // optional: name per axis of the batch grid
+//!   values:    List<T>,       // the flat, C-order values
+//!   dim_sizes: List<UInt32>,  // size per axis
+//!   dim_names: List<Utf8>,    // name per axis
 //! }
 //! ```
 //!
@@ -170,25 +168,19 @@ fn storage_value_type(data_type: &DataType) -> Result<DataType> {
         )));
     };
     let values = list_item(fields, "values")?;
-    check_item(fields, "dim_sizes", DataType::UInt32)?;
-    check_item(fields, "dim_names", DataType::Utf8)?;
-    // The grid fields are optional, but they come as a pair.
-    let has = |name: &str| fields.iter().any(|f| f.name() == name);
-    if has("grid_sizes") || has("grid_names") {
-        check_item(fields, "grid_sizes", DataType::UInt32)?;
-        check_item(fields, "grid_names", DataType::Utf8)?;
-    }
-    Ok(values)
-}
-
-fn check_item(fields: &Fields, name: &str, expected: DataType) -> Result<()> {
-    let item = list_item(fields, name)?;
-    if item != expected {
+    let sizes = list_item(fields, "dim_sizes")?;
+    let names = list_item(fields, "dim_names")?;
+    if sizes != DataType::UInt32 {
         return Err(invalid(format!(
-            "nd '{name}' must be List<{expected}>, got List<{item}>"
+            "nd 'dim_sizes' must be List<UInt32>, got List<{sizes}>"
         )));
     }
-    Ok(())
+    if names != DataType::Utf8 {
+        return Err(invalid(format!(
+            "nd 'dim_names' must be List<Utf8>, got List<{names}>"
+        )));
+    }
+    Ok(values)
 }
 
 fn list_item(fields: &Fields, name: &str) -> Result<DataType> {
