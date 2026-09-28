@@ -14,8 +14,8 @@ use datafusion::execution::config::SessionConfig;
 use datafusion::physical_plan::ExecutionPlan;
 
 use crate::exec::{
-    NdAxisReorderExec, NdCoalescePartitionsExec, NdEmptyExec, NdExecutionPlan, NdFilterExec,
-    NdLimitExec, NdProjectionExec, NdRepartitionExec, NdSourceExec, NdUnionExec,
+    NdAxisReorderExec, NdCoalescePartitionsExec, NdCoarsenExec, NdEmptyExec, NdExecutionPlan,
+    NdFilterExec, NdLimitExec, NdProjectionExec, NdRepartitionExec, NdSourceExec, NdUnionExec,
 };
 use crate::sink::NdSinkFactory;
 use crate::sinkers::{
@@ -91,6 +91,7 @@ impl NdNodeRegistry {
             .with_probe(probe_for::<NdEmptyExec>())
             .with_probe(probe_for::<NdAxisReorderExec>())
             .with_probe(probe_for::<NdCoalescePartitionsExec>())
+            .with_probe(probe_for::<NdCoarsenExec>())
             .with_sinker(Arc::new(FilterSinker))
             .with_sinker(Arc::new(ProjectionSinker))
             .with_sinker(Arc::new(UnionSinker))

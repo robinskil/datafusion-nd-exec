@@ -419,7 +419,7 @@ fn intersect_sorted(a: &UInt64Array, b: &UInt64Array) -> UInt64Array {
 }
 
 /// Row-major cartesian sum of per-axis offsets.
-pub(crate) fn cartesian_sum(axis_offsets: &[Vec<u64>]) -> Vec<u64> {
+pub fn cartesian_sum(axis_offsets: &[Vec<u64>]) -> Vec<u64> {
     let total: usize = axis_offsets.iter().map(Vec::len).product();
     let mut out = Vec::with_capacity(total);
     if total > 0 {

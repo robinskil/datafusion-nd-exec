@@ -10,6 +10,7 @@
 mod axis_reorder_exec;
 mod broadcast_exec;
 mod coalesce_exec;
+mod coarsen_exec;
 mod empty_exec;
 mod expr_column;
 mod filter_exec;
@@ -42,6 +43,7 @@ pub use axis_reorder_exec::NdAxisReorderExec;
 pub use broadcast_exec::NdBroadcastExec;
 pub use coalesce_exec::NdCoalescePartitionsExec;
 pub(crate) use coalesce_exec::merge_partitions;
+pub use coarsen_exec::{CoarsenReduce, NdCoarsenExec};
 pub use empty_exec::NdEmptyExec;
 pub use filter_exec::NdFilterExec;
 pub use limit_exec::NdLimitExec;
