@@ -18,7 +18,7 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use arrow::array::{Array, BooleanArray};
+use arrow::array::{Array, ArrayRef, BooleanArray, UInt64Array};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::PhysicalExpr;
@@ -31,6 +31,7 @@ use datafusion::physical_plan::{
 use futures::StreamExt;
 
 use nd_arrow_array::batch::NdRecordBatch;
+use nd_arrow_array::dimensions::Dimensions;
 use nd_arrow_array::selection::Selection;
 
 use super::expr_column::{NdExprColumn, ProjectMetrics};
@@ -138,40 +139,72 @@ impl NdFilterExec {
 }
 
 /// Evaluate the conjuncts over one nd batch and return the retained target
-/// cells. Each conjunct is evaluated on its footprint, its boolean mask is
-/// broadcast onto the target grid, and the masks are ANDed — a null predicate
-/// value excludes the cell. The result is intersected with any selection a
-/// child already accumulated, so it is always a subset of the batch's current
-/// rows.
+/// cells in the coarsest selection state that holds them. Each conjunct is
+/// evaluated on its footprint. A null predicate value excludes the cell.
+///
+/// A conjunct on one target axis keeps an index set of that axis, so the
+/// result stays a rectangle. The masks of all other conjuncts are broadcast
+/// onto the target grid and ANDed into one cell mask. The result is
+/// intersected with any selection a child already accumulated, so it is
+/// always a subset of the batch's current rows.
 fn retained_selection(
     columns: &[NdExprColumn],
     batch: &NdRecordBatch,
     metrics: &ProjectMetrics,
 ) -> Result<Selection> {
     let target = batch.target();
-    let n = target.num_elements();
+    let mut selection = batch.selection().clone();
 
-    // `keep[i]` starts true and is ANDed with each conjunct's mask over the full
-    // target grid, so all conjuncts combine in one coordinate system.
-    let mut keep = vec![true; n];
+    // `keep[i]` starts true and is ANDed with each multi-axis conjunct's mask
+    // over the full target grid.
+    let mut keep: Option<Vec<bool>> = None;
     for column in columns {
         let masked = column.project(batch, target, metrics)?;
+        if let Some(axis) = single_target_axis(masked.dims(), target) {
+            let mask = as_boolean(masked.values())?;
+            let indices: UInt64Array = (0..mask.len())
+                .filter(|&i| mask.is_valid(i) && mask.value(i))
+                .map(|i| i as u64)
+                .collect();
+            let own = Selection::along_axis(target, axis, indices)?;
+            selection = selection.intersect(&own, target)?;
+            continue;
+        }
         let broadcast = masked.materialize(target)?;
-        let mask = broadcast
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| {
-                DataFusionError::Plan(
-                    "NdFilterExec predicate did not evaluate to a boolean".to_string(),
-                )
-            })?;
+        let mask = as_boolean(&broadcast)?;
+        let keep = keep.get_or_insert_with(|| vec![true; target.num_elements()]);
         for (i, slot) in keep.iter_mut().enumerate() {
             *slot &= mask.is_valid(i) && mask.value(i);
         }
     }
 
-    let own = Selection::from_cell_mask(target, &BooleanArray::from(keep))?;
-    Ok(batch.selection().intersect(&own, target)?)
+    if let Some(keep) = keep {
+        let own = Selection::from_cell_mask(target, &BooleanArray::from(keep))?;
+        selection = selection.intersect(&own, target)?;
+    }
+    Ok(selection)
+}
+
+/// The target axis of a one-axis footprint, or `None` for any other
+/// footprint. A size-1 axis that broadcasts onto a longer target axis does not
+/// count.
+fn single_target_axis(footprint: &Dimensions, target: &Dimensions) -> Option<usize> {
+    let [dim] = footprint.iter().collect::<Vec<_>>()[..] else {
+        return None;
+    };
+    let axis = target.position(dim.name())?;
+    (target.get(axis).size() == dim.size()).then_some(axis)
+}
+
+fn as_boolean(array: &ArrayRef) -> Result<&BooleanArray> {
+    array
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| {
+            DataFusionError::Plan(
+                "NdFilterExec predicate did not evaluate to a boolean".to_string(),
+            )
+        })
 }
 
 impl DisplayAs for NdFilterExec {
@@ -350,6 +383,83 @@ mod tests {
             .cell_indices(batch.target())
             .values()
             .to_vec()
+    }
+
+    fn selection_of(
+        schema: &SchemaRef,
+        batch: &NdRecordBatch,
+        preds: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> Selection {
+        let columns = preds
+            .iter()
+            .map(|expr| NdExprColumn::build(schema, expr))
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        retained_selection(&columns, batch, &no_metrics()).unwrap()
+    }
+
+    fn pred(schema: &SchemaRef, name: &str, op: Operator, value: i32) -> Arc<dyn PhysicalExpr> {
+        binary(col(name, schema).unwrap(), op, lit(value), schema).unwrap()
+    }
+
+    /// A one-axis filter returns axis indices, and the batch after the filter
+    /// reports itself as a rectangle.
+    #[test]
+    fn a_one_axis_filter_keeps_a_rectangle() {
+        let (schema, batch) = test_batch();
+        let selection = selection_of(
+            &schema,
+            &batch,
+            vec![pred(&schema, "lat", Operator::Gt, 15)],
+        );
+        assert_eq!(
+            selection,
+            Selection::AxisIndices(vec![Some(UInt64Array::from(vec![1u64, 2])), None])
+        );
+        let filtered = batch.with_selection(selection).unwrap();
+        assert!(filtered.is_rectangle());
+        assert_eq!(filtered.num_rows(), 4);
+    }
+
+    /// One-axis conjuncts on two axes intersect to one rectangle.
+    #[test]
+    fn one_axis_filters_on_two_axes_keep_a_rectangle() {
+        let (schema, batch) = test_batch();
+        let selection = selection_of(
+            &schema,
+            &batch,
+            vec![
+                pred(&schema, "lat", Operator::Lt, 25),
+                pred(&schema, "lon", Operator::Eq, 2),
+            ],
+        );
+        assert_eq!(
+            selection,
+            Selection::AxisIndices(vec![
+                Some(UInt64Array::from(vec![0u64, 1])),
+                Some(UInt64Array::from(vec![1u64])),
+            ])
+        );
+        assert_eq!(selection.cell_indices(batch.target()).values(), &[1, 3]);
+    }
+
+    /// A full-rank conjunct makes the result a cell mask.
+    #[test]
+    fn a_full_rank_filter_gives_a_cell_mask() {
+        let (schema, batch) = test_batch();
+        let selection = selection_of(
+            &schema,
+            &batch,
+            vec![
+                pred(&schema, "lat", Operator::Gt, 15),
+                pred(&schema, "temp", Operator::GtEq, 3),
+            ],
+        );
+        assert_eq!(
+            selection,
+            Selection::CellMask(UInt64Array::from(vec![3u64, 4, 5]))
+        );
+        assert!(!selection.is_rectangle());
     }
 
     /// A single-axis predicate (`lat > 15`) selects whole lat-slices: cells
