@@ -160,4 +160,13 @@ impl ExecutionPlan for NdBroadcastExec {
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
     }
+    /// The nd child must stay a direct child: a repartition between two nd
+    /// nodes would break the nd side channel.
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
 }

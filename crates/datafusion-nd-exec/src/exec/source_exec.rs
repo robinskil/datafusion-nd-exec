@@ -129,6 +129,9 @@ impl ExecutionPlan for NdSourceExec {
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
     }
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
 }
 
 impl NdExecutionPlan for NdSourceExec {
