@@ -139,7 +139,8 @@ cargo test --workspace --all-features
 
 - Each nd node stores the registry it was built with. DataFusion rebuilds nodes in `with_new_children` without session access, so a stored registry keeps plan time and run time the same. The session extension stays, so a format can get the registry at plan time.
 - The `NdSinker` gets the nd child as `Arc<dyn ExecutionPlan>`. The rule checks the selection kinds itself.
-- The encoding records the batch grid in each column (`grid_sizes`, `grid_names`). Without it, a projection that drops every column on an axis loses that axis, and the nd path returns fewer rows than the flat path.
+- The grid of a scan comes from the dimensions of the selected columns only. A projection that drops every column on an axis also drops that axis, so the row count follows the selected dimensions. Filter columns count as selected.
+- The flat reference of the harness is the same nd scan without the nd rules, so each scan broadcasts at once. A fully broadcast `MemTable` is not a valid reference under this rule.
 - Nd nodes return `false` from `benefits_from_input_partitioning`. Without it, `EnforceDistribution` puts a `RepartitionExec` between two nd nodes and the plan fails.
 - The boundary rule looks through a round-robin `RepartitionExec` above the boundary.
 - The 46 ported operator tests stay as physical-plan tests. The harness adds 25 SQL queries over the two corpora.

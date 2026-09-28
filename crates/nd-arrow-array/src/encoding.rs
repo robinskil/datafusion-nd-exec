@@ -474,6 +474,32 @@ mod tests {
     }
 
     #[test]
+    fn a_projected_batch_has_the_grid_of_the_selected_columns() {
+        // Select only `elev{lat}`: the grid is `lat`, and `time` is gone.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("sst", DataType::Float64, true),
+            Field::new("elev", DataType::Int32, true),
+        ]));
+        let sst = NdArrowArray::try_new(
+            Arc::new(Float64Array::from(vec![0.0, 0.1, 0.2, 1.0, 1.1, 1.2])),
+            dims(&[("time", 2), ("lat", 3)]),
+        )
+        .unwrap();
+        let elev = NdArrowArray::try_new(
+            Arc::new(Int32Array::from(vec![5, 10, 15])),
+            dims(&[("lat", 3)]),
+        )
+        .unwrap();
+        let nd = NdRecordBatch::try_new(schema, vec![sst, elev], dims(&[("time", 2), ("lat", 3)]))
+            .unwrap();
+        let encoded = encode_nd_record_batch(&nd).unwrap();
+
+        let decoded = decode_nd_record_batch(&encoded.project(&[1]).unwrap()).unwrap();
+        assert_eq!(decoded.target(), &dims(&[("lat", 3)]));
+        assert_eq!(decoded.num_rows(), 3);
+    }
+
+    #[test]
     fn record_batch_round_trip_infers_target() {
         // time coord (1-D), lat coord (1-D), sst data (2-D) over (time=2, lat=3).
         let schema = Arc::new(Schema::new(vec![

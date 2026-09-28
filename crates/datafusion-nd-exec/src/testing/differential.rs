@@ -7,15 +7,16 @@ use arrow::util::display::{ArrayFormatter, FormatOptions};
 use datafusion::error::Result;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::physical_plan::displayable;
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 
 use super::table::NdMemTable;
 use crate::registry::NdNodeRegistry;
 use crate::session::NdSessionStateBuilderExt;
 
-/// Two sessions over the same tables. The flat session scans materialized
-/// rows with no nd nodes. The nd session scans nd batches with the nd
-/// pipeline enabled.
+/// Two sessions over the same tables. The flat session has no nd rules, so
+/// each scan broadcasts to flat rows at once. The nd session has the nd
+/// pipeline enabled. In both sessions, the grid of a scan comes from the
+/// dimensions of the selected columns only.
 pub struct Differential {
     flat: SessionContext,
     nd: SessionContext,
@@ -35,21 +36,22 @@ impl Differential {
 
     /// Sessions whose nd side uses `registry`.
     pub fn with_registry(registry: Arc<NdNodeRegistry>) -> Self {
+        let flat_config = SessionConfig::new().with_extension(registry.clone());
         let nd_state = SessionStateBuilder::new()
             .with_default_features()
             .with_nd_pipeline(registry)
             .build();
         Self {
-            flat: SessionContext::new(),
+            flat: SessionContext::new_with_config(flat_config),
             nd: SessionContext::new_with_state(nd_state),
         }
     }
 
     /// Register `table` as `name` in both sessions.
     pub fn register(&self, name: &str, table: NdMemTable) -> Result<()> {
-        self.flat
-            .register_table(name, Arc::new(table.to_flat_table()?))?;
-        self.nd.register_table(name, Arc::new(table))?;
+        let table = Arc::new(table);
+        self.flat.register_table(name, table.clone())?;
+        self.nd.register_table(name, table)?;
         Ok(())
     }
 

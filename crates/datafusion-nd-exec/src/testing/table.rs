@@ -7,7 +7,7 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::datasource::memory::{MemTable, MemorySourceConfig};
+use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::Expr;
@@ -69,29 +69,6 @@ impl NdMemTable {
 
     pub fn partitions(&self) -> &[Vec<NdRecordBatch>] {
         &self.partitions
-    }
-
-    /// The same data as a flat [`MemTable`]: each nd batch materialized to
-    /// flat rows. It is the reference for a differential test.
-    pub fn to_flat_table(&self) -> Result<MemTable> {
-        let partitions = self
-            .partitions
-            .iter()
-            .map(|batches| {
-                batches
-                    .iter()
-                    .map(|batch| {
-                        let flat = batch.materialize()?;
-                        Ok(RecordBatch::try_new_with_options(
-                            self.schema.clone(),
-                            flat.columns().to_vec(),
-                            &RecordBatchOptions::new().with_row_count(Some(flat.num_rows())),
-                        )?)
-                    })
-                    .collect::<Result<Vec<_>>>()
-            })
-            .collect::<Result<Vec<_>>>()?;
-        MemTable::try_new(self.schema.clone(), partitions)
     }
 }
 

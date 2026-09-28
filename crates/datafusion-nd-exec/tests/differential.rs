@@ -59,3 +59,28 @@ async fn profile_queries_match_the_flat_path() -> Result<()> {
     }
     Ok(())
 }
+
+/// The grid of a scan comes from the dimensions of the selected columns only.
+#[tokio::test]
+async fn the_row_count_follows_the_selected_dimensions() -> Result<()> {
+    let harness = harness()?;
+    let cases = [
+        // `time, lat, lon` in two chunks of 2 x 3 x 2 cells.
+        ("SELECT sst FROM grid", 24),
+        // `lat, lon` in each of the two chunks.
+        ("SELECT elev FROM grid", 12),
+        ("SELECT source, elev FROM grid WHERE elev >= 0", 8),
+        // `lat` in each of the two chunks.
+        ("SELECT lat FROM grid", 6),
+        // A filter column counts as selected: `time, lat`, minus time 100.
+        ("SELECT lat FROM grid WHERE time > 100", 9),
+        // `N_PROF` in each of the two files.
+        (r#"SELECT "PLATFORM_NUMBER" FROM profiles"#, 5),
+    ];
+    for (sql, expected) in cases {
+        let batches = harness.assert_same(sql).await?;
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, expected, "{sql}");
+    }
+    Ok(())
+}
