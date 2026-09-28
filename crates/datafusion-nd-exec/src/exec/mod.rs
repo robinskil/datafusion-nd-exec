@@ -7,7 +7,9 @@
 //! `execute` still yields flat batches (by materializing), so any nd node is
 //! also a correct plan on its own.
 
+mod axis_reorder_exec;
 mod broadcast_exec;
+mod empty_exec;
 mod expr_column;
 mod filter_exec;
 mod limit_exec;
@@ -35,7 +37,9 @@ use nd_arrow_array::{NdRecordBatch, SelectionKind};
 
 use crate::registry::NdNodeRegistry;
 
+pub use axis_reorder_exec::NdAxisReorderExec;
 pub use broadcast_exec::NdBroadcastExec;
+pub use empty_exec::NdEmptyExec;
 pub use filter_exec::NdFilterExec;
 pub use limit_exec::NdLimitExec;
 pub use projection_exec::NdProjectionExec;
