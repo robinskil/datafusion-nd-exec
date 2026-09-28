@@ -45,6 +45,8 @@ struct FilterMetrics {
     input_rows: Count,
     /// Cells removed by the predicate.
     rows_pruned: Count,
+    /// Mask values read at retained cells by the multi-axis conjuncts.
+    cells_evaluated: Count,
     /// Footprint evaluation work of the conjuncts (shared with projection).
     project: ProjectMetrics,
 }
@@ -129,7 +131,12 @@ impl NdFilterExec {
         metrics: &FilterMetrics,
     ) -> Result<NdRecordBatch> {
         metrics.input_rows.add(batch.num_rows());
-        let retained = retained_selection(&self.columns, batch, &metrics.project)?;
+        let retained = retained_selection(
+            &self.columns,
+            batch,
+            &metrics.project,
+            &metrics.cells_evaluated,
+        )?;
         let kept = retained.num_rows(batch.target());
         metrics
             .rows_pruned
@@ -142,47 +149,61 @@ impl NdFilterExec {
 /// cells in the coarsest selection state that holds them. Each conjunct is
 /// evaluated on its footprint. A null predicate value excludes the cell.
 ///
-/// A conjunct on one target axis keeps an index set of that axis, so the
-/// result stays a rectangle. The masks of all other conjuncts are broadcast
-/// onto the target grid and ANDed into one cell mask. The result is
-/// intersected with any selection a child already accumulated, so it is
-/// always a subset of the batch's current rows.
+/// The conjuncts on one target axis apply first: each keeps an index set of
+/// its axis, so the selection stays a rectangle. Each other conjunct then
+/// reads its footprint mask only at the cells that the selection still keeps,
+/// so no mask of the full grid is built. `cells_evaluated` counts those mask
+/// reads. The result starts from any selection a child already accumulated,
+/// so it is always a subset of the batch's current rows.
 fn retained_selection(
     columns: &[NdExprColumn],
     batch: &NdRecordBatch,
     metrics: &ProjectMetrics,
+    cells_evaluated: &Count,
 ) -> Result<Selection> {
     let target = batch.target();
     let mut selection = batch.selection().clone();
 
-    // `keep[i]` starts true and is ANDed with each multi-axis conjunct's mask
-    // over the full target grid.
-    let mut keep: Option<Vec<bool>> = None;
+    let mut residual = Vec::new();
     for column in columns {
         let masked = column.project(batch, target, metrics)?;
-        if let Some(axis) = single_target_axis(masked.dims(), target) {
-            let mask = as_boolean(masked.values())?;
-            let indices: UInt64Array = (0..mask.len())
-                .filter(|&i| mask.is_valid(i) && mask.value(i))
-                .map(|i| i as u64)
-                .collect();
-            let own = Selection::along_axis(target, axis, indices)?;
-            selection = selection.intersect(&own, target)?;
-            continue;
+        match single_target_axis(masked.dims(), target) {
+            Some(axis) => {
+                let mask = as_boolean(masked.values())?;
+                let indices: UInt64Array = (0..mask.len())
+                    .filter(|&i| mask.is_valid(i) && mask.value(i))
+                    .map(|i| i as u64)
+                    .collect();
+                let own = Selection::along_axis(target, axis, indices)?;
+                selection = selection.intersect(&own, target)?;
+            }
+            None => residual.push(masked),
         }
-        let broadcast = masked.materialize(target)?;
-        let mask = as_boolean(&broadcast)?;
-        let keep = keep.get_or_insert_with(|| vec![true; target.num_elements()]);
+    }
+    if residual.is_empty() {
+        return Ok(selection.coarsen(target));
+    }
+
+    // `keep[i]` is for the i-th retained cell, in row-major order.
+    let cells = selection.cell_indices(target);
+    let mut keep = vec![true; cells.len()];
+    for masked in &residual {
+        let at_cells = masked.broadcast_map(target)?.gather_indices_for(&selection);
+        let values = masked.take_indices(&at_cells)?;
+        let mask = as_boolean(&values)?;
         for (i, slot) in keep.iter_mut().enumerate() {
             *slot &= mask.is_valid(i) && mask.value(i);
         }
+        cells_evaluated.add(cells.len());
     }
-
-    if let Some(keep) = keep {
-        let own = Selection::from_cell_mask(target, &BooleanArray::from(keep))?;
-        selection = selection.intersect(&own, target)?;
-    }
-    Ok(selection)
+    let kept: UInt64Array = cells
+        .values()
+        .iter()
+        .zip(&keep)
+        .filter(|(_, keep)| **keep)
+        .map(|(cell, _)| *cell)
+        .collect();
+    Ok(Selection::CellMask(kept).coarsen(target))
 }
 
 /// The target axis of a one-axis footprint, or `None` for any other
@@ -282,6 +303,8 @@ impl NdExecutionPlan for NdFilterExec {
         let filter_metrics = FilterMetrics {
             input_rows: MetricBuilder::new(&self.metrics).counter("input_rows", partition),
             rows_pruned: MetricBuilder::new(&self.metrics).counter("rows_pruned", partition),
+            cells_evaluated: MetricBuilder::new(&self.metrics)
+                .counter("cells_evaluated", partition),
             project: ProjectMetrics {
                 elements_evaluated: MetricBuilder::new(&self.metrics)
                     .counter("elements_evaluated", partition),
@@ -378,7 +401,7 @@ mod tests {
             .map(|expr| NdExprColumn::build(schema, expr))
             .collect::<Result<Vec<_>>>()
             .unwrap();
-        retained_selection(&columns, batch, &no_metrics())
+        retained_selection(&columns, batch, &no_metrics(), &Count::new())
             .unwrap()
             .cell_indices(batch.target())
             .values()
@@ -395,7 +418,7 @@ mod tests {
             .map(|expr| NdExprColumn::build(schema, expr))
             .collect::<Result<Vec<_>>>()
             .unwrap();
-        retained_selection(&columns, batch, &no_metrics()).unwrap()
+        retained_selection(&columns, batch, &no_metrics(), &Count::new()).unwrap()
     }
 
     fn pred(schema: &SchemaRef, name: &str, op: Operator, value: i32) -> Arc<dyn PhysicalExpr> {
@@ -441,6 +464,51 @@ mod tests {
             ])
         );
         assert_eq!(selection.cell_indices(batch.target()).values(), &[1, 3]);
+    }
+
+    /// A monotone inner-axis predicate keeps a prefix of each profile.
+    #[test]
+    fn an_inner_axis_prefix_filter_is_ragged() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("PRES", DataType::Int32, true)]));
+        let grid = dims(&[("N_PROF", 2), ("N_LEVELS", 3)]);
+        let pres = NdArrowArray::try_new(
+            Arc::new(Int32Array::from(vec![10, 20, 30, 10, 30, 40])),
+            grid.clone(),
+        )
+        .unwrap();
+        let batch = NdRecordBatch::try_new(schema.clone(), vec![pres], grid).unwrap();
+
+        let selection = selection_of(
+            &schema,
+            &batch,
+            vec![pred(&schema, "PRES", Operator::Lt, 25)],
+        );
+        assert_eq!(
+            selection,
+            Selection::Ragged {
+                lengths: UInt64Array::from(vec![2u64, 1])
+            }
+        );
+    }
+
+    /// A multi-axis conjunct reads its mask only at the cells that the
+    /// one-axis conjuncts keep.
+    #[test]
+    fn a_multi_axis_mask_is_read_only_at_retained_cells() {
+        let (schema, batch) = test_batch();
+        let columns = [
+            pred(&schema, "lat", Operator::Gt, 15),
+            pred(&schema, "temp", Operator::GtEq, 3),
+        ]
+        .iter()
+        .map(|expr| NdExprColumn::build(&schema, expr))
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+        let evaluated = Count::new();
+        retained_selection(&columns, &batch, &no_metrics(), &evaluated).unwrap();
+        // `lat > 15` keeps 4 of the 6 cells.
+        assert_eq!(evaluated.value(), 4);
     }
 
     /// A full-rank conjunct makes the result a cell mask.
