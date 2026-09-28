@@ -1,4 +1,4 @@
-//! The built-in sink checks: filter and projection.
+//! The built-in sink checks.
 
 use std::sync::Arc;
 
@@ -8,8 +8,9 @@ use datafusion::physical_expr::{PhysicalExpr, conjunction, split_conjunction};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::filter::{FilterExec, FilterExecBuilder};
 use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::union::UnionExec;
 
-use crate::exec::{NdExecutionPlan, NdFilterExec, NdProjectionExec};
+use crate::exec::{NdExecutionPlan, NdFilterExec, NdProjectionExec, NdUnionExec};
 use crate::optimizer::is_pushable_expr;
 use crate::registry::{NdNodeRegistry, NdSinker, Sunk};
 
@@ -143,6 +144,44 @@ impl NdSinker for ProjectionSinker {
             Some(projection.schema()),
             registry.clone(),
         )?;
+        Ok(Some(Sunk {
+            nd: Arc::new(nd),
+            residual: None,
+        }))
+    }
+}
+
+/// Sinks a `UnionExec` whose inputs are all boundaries into an
+/// [`NdUnionExec`].
+///
+/// ```text
+/// UnionExec                          NdBroadcastExec
+///   NdBroadcastExec           ->       NdUnionExec
+///     nd-child-a                         nd-child-a
+///   NdBroadcastExec                      nd-child-b
+///     nd-child-b
+/// ```
+///
+/// Each input must have exactly the schema of the union, because each nd batch
+/// carries the schema of its own input.
+#[derive(Debug, Default)]
+pub struct UnionSinker;
+
+impl NdSinker for UnionSinker {
+    fn try_sink(
+        &self,
+        parent: &Arc<dyn ExecutionPlan>,
+        children: &[Arc<dyn ExecutionPlan>],
+        registry: &Arc<NdNodeRegistry>,
+    ) -> Result<Option<Sunk>> {
+        if !parent.as_any().is::<UnionExec>() {
+            return Ok(None);
+        }
+        let schema = parent.schema();
+        if children.iter().any(|child| child.schema() != schema) {
+            return Ok(None);
+        }
+        let nd = NdUnionExec::try_new_with_registry(children.to_vec(), registry.clone())?;
         Ok(Some(Sunk {
             nd: Arc::new(nd),
             residual: None,

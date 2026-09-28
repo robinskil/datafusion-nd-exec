@@ -12,6 +12,7 @@ mod expr_column;
 mod filter_exec;
 mod projection_exec;
 mod source_exec;
+mod union_exec;
 
 use std::sync::Arc;
 
@@ -36,6 +37,7 @@ pub use broadcast_exec::NdBroadcastExec;
 pub use filter_exec::NdFilterExec;
 pub use projection_exec::NdProjectionExec;
 pub use source_exec::NdSourceExec;
+pub use union_exec::NdUnionExec;
 
 /// Stream of nd batches exchanged between nd-aware operators.
 pub type SendableNdBatchStream = BoxStream<'static, Result<NdRecordBatch>>;

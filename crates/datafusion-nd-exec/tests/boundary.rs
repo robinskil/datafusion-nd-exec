@@ -108,6 +108,24 @@ async fn a_volatile_conjunct_stays_above_the_broadcast() -> Result<()> {
 }
 
 #[tokio::test]
+async fn a_union_of_nd_scans_runs_below_the_broadcast() -> Result<()> {
+    let harness = harness()?;
+    let sql = "SELECT lat, sst FROM grid UNION ALL SELECT lat, sst FROM grid";
+    harness
+        .assert_plan_nodes(sql, &["NdBroadcastExec", "NdUnionExec", "NdSourceExec"])
+        .await?;
+    let plan = harness.nd_plan(sql).await?;
+    assert!(
+        !plan
+            .lines()
+            .any(|l| l.trim_start().starts_with("UnionExec")),
+        "no UnionExec may stay above the broadcast:
+{plan}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn explain_shows_the_nd_region() -> Result<()> {
     let harness = harness()?;
     let explained = harness

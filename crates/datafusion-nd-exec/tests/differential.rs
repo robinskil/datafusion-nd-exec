@@ -30,6 +30,8 @@ const GRID_QUERIES: &[&str] = &[
     "SELECT CASE WHEN sst > 5 THEN 'warm' ELSE 'cold' END AS c, count(*) FROM grid GROUP BY 1",
     "SELECT * FROM grid WHERE random() < 2 AND lat > 0",
     "SELECT time, lat, lon FROM grid ORDER BY time DESC, lat, lon LIMIT 5",
+    "SELECT * FROM grid UNION ALL SELECT * FROM grid",
+    "SELECT lat, sst FROM grid WHERE lat > 0 UNION ALL SELECT lat, sst FROM grid WHERE sst < 3",
 ];
 
 const PROFILE_QUERIES: &[&str] = &[
@@ -40,6 +42,7 @@ const PROFILE_QUERIES: &[&str] = &[
     r#"SELECT "PLATFORM_NUMBER", max("PRES"), avg("TEMP") FROM profiles GROUP BY "PLATFORM_NUMBER""#,
     "SELECT count(*) FROM profiles",
     r#"SELECT count("TEMP") FROM profiles WHERE "TEMP" > 18"#,
+    r#"SELECT * FROM profiles UNION ALL SELECT * FROM profiles WHERE "PRES" < 25"#,
 ];
 
 #[tokio::test]
