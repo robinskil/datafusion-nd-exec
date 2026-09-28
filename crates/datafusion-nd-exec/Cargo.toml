@@ -7,15 +7,19 @@ rust-version.workspace = true
 repository.workspace = true
 
 [features]
-test-utils = []
+test-utils = ["dep:async-trait"]
 
 [dependencies]
 nd-arrow-array = { workspace = true }
 arrow = { workspace = true }
 datafusion = { workspace = true }
 futures = { workspace = true }
+async-trait = { workspace = true, optional = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
+# Enables the test harness for the integration tests.
+datafusion-nd-exec = { path = ".", features = ["test-utils"] }
 tokio = { workspace = true }
 
 [lints]

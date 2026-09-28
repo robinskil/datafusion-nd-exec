@@ -12,6 +12,7 @@ repository = "https://github.com/robinskil/datafusion-nd-exec"
 nd-arrow-array = { path = "crates/nd-arrow-array", version = "0.1.0" }
 arrow = "^58"
 arrow-schema = "^58"
+async-trait = "0.1.88"
 datafusion = "^53"
 futures = "0.3.31"
 serde = { version = "1.0", features = ["derive"] }

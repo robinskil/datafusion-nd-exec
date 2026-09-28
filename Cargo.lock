@@ -1120,7 +1120,9 @@ name = "datafusion-nd-exec"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "datafusion",
+ "datafusion-nd-exec",
  "futures",
  "nd-arrow-array",
  "tokio",
