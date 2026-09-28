@@ -44,7 +44,7 @@ Axis modes:
 
 - Default mode: `Coordinate` when the batch has the coordinate column of the axis (from `AxisMeta`), else `Fixed`. A caller sets a mode per axis name.
 - `place(&mut self, batch) -> Result<Placement>`: compact the batch, then return per output axis the offset, the chunk size, the new extent, and the coordinate values that the chunk adds.
-- The output axis order is the order of the first chunk. An axis that a later chunk adds goes at the end.
+- The output axis order is the order of the first chunk. Every chunk must have the same set of axes.
 - Values are compared with the Arrow row format, so any orderable type works.
 
 ## 4. Sink terminal (#452, #456)
