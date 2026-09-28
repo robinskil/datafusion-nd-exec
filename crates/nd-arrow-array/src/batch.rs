@@ -3,12 +3,13 @@
 
 use crate::error::Result;
 use crate::error::nd_err;
-use arrow::array::{ArrayRef, RecordBatchOptions};
+use arrow::array::{ArrayRef, BooleanArray, RecordBatchOptions, UInt64Array};
+use arrow::compute::nullif;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
 use super::array::NdArrowArray;
-use super::dimensions::Dimensions;
+use super::dimensions::{Dimension, Dimensions};
 use super::selection::Selection;
 
 /// A record batch whose columns are [`NdArrowArray`]s over a shared target
@@ -100,6 +101,90 @@ impl NdRecordBatch {
     /// Rows in the materialized batch: the number of retained cells.
     pub fn num_rows(&self) -> usize {
         self.selection.num_rows(&self.target)
+    }
+
+    /// A batch with a `Full` selection, for a writer that needs dense chunks.
+    ///
+    /// - `AxisIndices`: take the kept indices along each axis. The grid gets
+    ///   smaller and the rows do not change.
+    /// - `Ragged` and `CellMask`: keep the grid. A column that spans the
+    ///   whole grid gets null at each cell that is not kept. A column on fewer
+    ///   axes, such as a coordinate, does not change. The result has a row
+    ///   for every cell of the grid.
+    pub fn compact(&self) -> Result<NdRecordBatch> {
+        match &self.selection {
+            Selection::Full => Ok(self.clone()),
+            Selection::AxisIndices(axes) => self.compact_axes(axes),
+            other => self.mask_full_rank(other),
+        }
+    }
+
+    fn compact_axes(&self, axes: &[Option<UInt64Array>]) -> Result<NdRecordBatch> {
+        let kept = |axis: usize| axes[axis].as_ref();
+        let target = Dimensions::try_new(
+            self.target
+                .iter()
+                .enumerate()
+                .map(|(axis, dim)| {
+                    let size = kept(axis).map_or(dim.size(), |indices| indices.len());
+                    Dimension::new(dim.name(), size).with_meta(dim.meta().cloned())
+                })
+                .collect(),
+        )?;
+        let columns = self
+            .columns
+            .iter()
+            .map(|column| {
+                // Constrain each column axis that spans its target axis. A
+                // size-1 axis broadcasts, so it stays as it is.
+                let dims = column.dims();
+                let own: Vec<Option<UInt64Array>> = dims
+                    .iter()
+                    .map(|dim| {
+                        let axis = self.target.position(dim.name())?;
+                        let indices = kept(axis)?;
+                        (dim.size() == self.target.get(axis).size()).then(|| indices.clone())
+                    })
+                    .collect();
+                if own.iter().all(Option::is_none) {
+                    return Ok(column.clone());
+                }
+                let new_dims = Dimensions::try_new(
+                    dims.iter()
+                        .zip(&own)
+                        .map(|(dim, indices)| {
+                            let size = indices.as_ref().map_or(dim.size(), |i| i.len());
+                            Dimension::new(dim.name(), size).with_meta(dim.meta().cloned())
+                        })
+                        .collect(),
+                )?;
+                let cells = Selection::AxisIndices(own).cell_indices(dims);
+                NdArrowArray::try_new(column.take_indices(&cells)?, new_dims)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        NdRecordBatch::try_new(self.schema.clone(), columns, target)
+    }
+
+    fn mask_full_rank(&self, selection: &Selection) -> Result<NdRecordBatch> {
+        let mut dropped = vec![true; self.target.num_elements()];
+        for &cell in selection.cell_indices(&self.target).values() {
+            dropped[cell as usize] = false;
+        }
+        let dropped = BooleanArray::from(dropped);
+        let columns = self
+            .columns
+            .iter()
+            .map(|column| {
+                if column.dims().num_elements() != self.target.num_elements() {
+                    return Ok(column.clone());
+                }
+                // Put the column in target order, then null the dropped cells.
+                let values = column.materialize(&self.target)?;
+                let masked = nullif(values.as_ref(), &dropped)?;
+                NdArrowArray::try_new(masked, self.target.clone())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        NdRecordBatch::try_new(self.schema.clone(), columns, self.target.clone())
     }
 
     /// Materialize into a flat Arrow [`RecordBatch`] by broadcasting each
@@ -276,6 +361,57 @@ mod tests {
         assert_eq!(
             out.column(2).as_primitive::<Float64Type>().values(),
             &[0.0, 1.0, 1.1, 1.2]
+        );
+    }
+
+    #[test]
+    fn compact_axis_indices_gives_a_smaller_grid() {
+        // Keep lat 1 and 2 for both time steps.
+        let selected = test_batch()
+            .with_selection(Selection::AxisIndices(vec![
+                None,
+                Some(UInt64Array::from(vec![1u64, 2])),
+            ]))
+            .unwrap();
+        let compact = selected.compact().unwrap();
+        assert_eq!(compact.selection(), &Selection::Full);
+        assert_eq!(compact.target(), &dims(&[("time", 2), ("lat", 2)]));
+        assert_eq!(compact.column(0).dims(), &dims(&[("time", 2)]));
+        assert_eq!(
+            compact
+                .column(1)
+                .values()
+                .as_primitive::<Int32Type>()
+                .values(),
+            &[20, 30]
+        );
+        assert_eq!(
+            compact.materialize().unwrap(),
+            selected.materialize().unwrap()
+        );
+    }
+
+    #[test]
+    fn compact_cell_mask_nulls_the_dropped_cells() {
+        let selected = test_batch()
+            .with_selection(Selection::CellMask(UInt64Array::from(vec![1u64, 3, 5])))
+            .unwrap();
+        let compact = selected.compact().unwrap();
+        assert_eq!(compact.target(), selected.target());
+        assert_eq!(compact.num_rows(), 6);
+        // The coordinates do not change; the full-rank column is masked.
+        assert_eq!(compact.column(0).dims(), &dims(&[("time", 2)]));
+        let sst = compact.column(2).values();
+        assert_eq!(sst.null_count(), 3);
+        assert!(sst.is_null(0) && sst.is_valid(1) && sst.is_null(2));
+    }
+
+    #[test]
+    fn compact_keeps_a_full_selection() {
+        let batch = test_batch();
+        assert_eq!(
+            batch.compact().unwrap().materialize().unwrap(),
+            batch.materialize().unwrap()
         );
     }
 
