@@ -11,8 +11,8 @@
 //! }
 //! ```
 //!
-//! The struct field carries the `beacon.nd` Arrow extension type so the intent
-//! survives IPC. Because it is an ordinary Arrow array, an nd batch encoded
+//! The struct field carries the registered [`NdArrayType`] extension type, so
+//! the intent survives IPC. Because it is an ordinary Arrow array, an nd batch encoded
 //! this way rides through a `DataSourceExec` (and any other operator) as a
 //! normal `RecordBatch`; `NdSourceExec` decodes
 //! it back into an [`NdRecordBatch`] on the way out.
@@ -28,12 +28,15 @@ use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
+use arrow_schema::extension::ExtensionType;
+
 use super::array::NdArrowArray;
 use super::batch::NdRecordBatch;
 use super::dimensions::{Dimension, Dimensions};
+use super::extension::NdArrayType;
 
 /// Arrow extension type name tagged on an nd column's field.
-pub const ND_EXTENSION_NAME: &str = "beacon.nd";
+pub const ND_EXTENSION_NAME: &str = NdArrayType::NAME;
 
 fn err(e: impl std::fmt::Display) -> ArrowError {
     ArrowError::InvalidArgumentError(e.to_string())
@@ -66,27 +69,23 @@ pub fn nd_encoded_type(value_type: &DataType) -> DataType {
 }
 
 /// An nd column field named `name` carrying values of `value_type`, tagged with
-/// the `beacon.nd` extension type.
+/// the [`NdArrayType`] extension type.
 pub fn nd_encoded_field(name: &str, value_type: &DataType) -> Field {
     nd_encoded_field_of(&Field::new(name, value_type.clone(), true))
 }
 
-/// `field`, with its values carried as a `beacon.nd` struct.
+/// `field`, with its values carried as an [`NdArrayType`] struct.
 ///
 /// The field's own metadata travels with it, and the extension keys go on top.
 /// A scan's target schema is the *encoded* one, and the GeoArrow keys of a
 /// geometry column live in that metadata.
 pub fn nd_encoded_field_of(field: &Field) -> Field {
-    let mut metadata = field.metadata().clone();
-    metadata.insert(
-        "ARROW:extension:name".to_string(),
-        ND_EXTENSION_NAME.to_string(),
-    );
-    metadata.insert("ARROW:extension:metadata".to_string(), "{}".to_string());
-    Field::new(field.name(), nd_encoded_type(field.data_type()), true).with_metadata(metadata)
+    Field::new(field.name(), nd_encoded_type(field.data_type()), true)
+        .with_metadata(field.metadata().clone())
+        .with_extension_type(NdArrayType::new(field.data_type().clone()))
 }
 
-/// The nd-encoded schema of a logical schema: every field becomes a `beacon.nd`
+/// The nd-encoded schema of a logical schema: every field becomes an nd
 /// struct column of the same name. This is the schema a `DataSourceExec` carries
 /// while nd data flows up to `NdSourceExec`.
 pub fn encoded_schema(logical: &Schema) -> Schema {
@@ -98,13 +97,10 @@ pub fn encoded_schema(logical: &Schema) -> Schema {
     Schema::new_with_metadata(fields, logical.metadata().clone())
 }
 
-/// True when `field` is an nd-encoded column.
+/// True when `field` is an nd-encoded column: it carries the [`NdArrayType`]
+/// extension type over a valid storage type.
 pub fn is_nd_encoded(field: &Field) -> bool {
-    field
-        .metadata()
-        .get("ARROW:extension:name")
-        .map(String::as_str)
-        == Some(ND_EXTENSION_NAME)
+    field.try_extension_type::<NdArrayType>().is_ok()
 }
 
 /// Element type carried by an nd-encoded struct type (the `values` list item).
@@ -218,7 +214,7 @@ pub fn decode_nd_array(column: &ArrayRef, row: usize) -> Result<NdArrowArray> {
     NdArrowArray::try_new(values, dims)
 }
 
-/// Encode an [`NdRecordBatch`] as a flat `RecordBatch` of nd-encoded (`beacon.nd`)
+/// Encode an [`NdRecordBatch`] as a flat `RecordBatch` of nd-encoded (`nd.array`)
 /// struct columns — one struct row per column.
 pub fn encode_nd_record_batch(batch: &NdRecordBatch) -> Result<RecordBatch> {
     let fields: Vec<Field> = batch
@@ -253,7 +249,7 @@ pub fn encode_flat_batch_as_nd(batch: &RecordBatch) -> Result<RecordBatch> {
     encode_nd_record_batch(&nd)
 }
 
-/// The logical (decoded) schema of an nd-encoded schema: each `beacon.nd`
+/// The logical (decoded) schema of an nd-encoded schema: each `nd.array`
 /// struct column becomes its element type.
 ///
 /// Nullability follows the encoded field. [`nd_encoded_field`] makes every
@@ -389,6 +385,28 @@ mod tests {
     }
 
     #[test]
+    fn a_field_without_the_extension_type_is_not_encoded() {
+        let plain = Field::new("sst", nd_encoded_type(&DataType::Float64), true);
+        assert!(!is_nd_encoded(&plain));
+
+        let other_name = plain
+            .with_metadata([("ARROW:extension:name".to_string(), "beacon.nd".to_string())].into());
+        assert!(!is_nd_encoded(&other_name));
+    }
+
+    #[test]
+    fn encoded_field_keeps_its_own_metadata() {
+        let field = Field::new("geom", DataType::Binary, true)
+            .with_metadata([("crs".to_string(), "EPSG:4326".to_string())].into());
+        let encoded = nd_encoded_field_of(&field);
+        assert!(is_nd_encoded(&encoded));
+        assert_eq!(
+            encoded.metadata().get("crs").map(String::as_str),
+            Some("EPSG:4326")
+        );
+    }
+
+    #[test]
     fn record_batch_round_trip_infers_target() {
         // time coord (1-D), lat coord (1-D), sst data (2-D) over (time=2, lat=3).
         let schema = Arc::new(Schema::new(vec![
@@ -416,7 +434,7 @@ mod tests {
         )
         .unwrap();
 
-        // Encode → flat struct RecordBatch, all columns tagged beacon.nd.
+        // Encode → flat struct RecordBatch, all columns tagged nd.array.
         let encoded = encode_nd_record_batch(&nd).unwrap();
         assert_eq!(encoded.num_rows(), 1);
         assert_eq!(encoded.num_columns(), 3);
