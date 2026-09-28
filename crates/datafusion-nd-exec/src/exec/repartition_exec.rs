@@ -205,7 +205,11 @@ impl NdExecutionPlan for NdRepartitionExec {
         let mut channels = self.channels.lock().map_err(|_| {
             DataFusionError::Internal("NdRepartitionExec state lock is poisoned".to_string())
         })?;
-        if channels.is_none() {
+        // A new execution starts when every output of the last one is taken.
+        let spent = channels
+            .as_ref()
+            .is_none_or(|c| c.receivers.iter().all(Option::is_none));
+        if spent {
             *channels = Some(self.start(context)?);
         }
         let channels = channels.as_mut().expect("set above");
@@ -279,5 +283,28 @@ mod tests {
         let context = Arc::new(TaskContext::default());
         assert!(repartition.execute_nd(0, context.clone()).is_ok());
         assert!(repartition.execute_nd(0, context).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_plan_runs_again_after_every_output_is_taken() {
+        let scan = grid_table()
+            .unwrap()
+            .nd_scan(None, NdNodeRegistry::shared_default())
+            .unwrap();
+        let repartition = NdRepartitionExec::try_new(scan.children()[0].clone(), 2).unwrap();
+        let context = Arc::new(TaskContext::default());
+        for _ in 0..2 {
+            let mut rows = 0;
+            for partition in 0..2 {
+                let batches: Vec<_> = repartition
+                    .execute_nd(partition, context.clone())
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap();
+                rows += batches.iter().map(|b| b.num_rows()).sum::<usize>();
+            }
+            assert_eq!(rows, 24);
+        }
     }
 }
