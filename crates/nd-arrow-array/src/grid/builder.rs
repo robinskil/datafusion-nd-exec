@@ -28,8 +28,10 @@ pub struct NdBatchRecord {
 }
 
 impl NdBatchRecord {
-    /// The record of `batch`. An axis has coordinate values when its metadata
-    /// names a column of the batch that lives on that axis alone.
+    /// The record of `batch`. An axis has coordinate values when a column of
+    /// the batch lives on that axis alone, with one value per index. The axis
+    /// metadata names that column. Without metadata, it is the column with the
+    /// name of the axis. `AxisMeta::no_coordinate()` turns the rule off.
     pub fn of(partition: usize, number: usize, batch: &NdRecordBatch) -> Self {
         let coordinates = batch
             .target()
@@ -59,7 +61,11 @@ impl NdBatchRecord {
 }
 
 fn coordinate_values(batch: &NdRecordBatch, dim: &Dimension) -> Option<ArrayRef> {
-    let name = dim.meta()?.coordinate_column()?;
+    // Without metadata, the column with the name of the axis is its coordinate.
+    let name = match dim.meta() {
+        Some(meta) => meta.coordinate_column()?,
+        None => dim.name(),
+    };
     let column = batch.column(batch.schema().index_of(name).ok()?);
     let dims = column.dims();
     let on_axis = dims.rank() == 1 && dims.get(0).name() == dim.name();
@@ -628,5 +634,66 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(positions(&placements[1], "time"), [2]);
+    }
+
+    /// A chunk on `time` with one column per name. Column `i` holds `10 * i + 5, 10 * i + 6`.
+    fn on_time(meta: Option<AxisMeta>, names: &[&str]) -> NdRecordBatch {
+        let dims = Dimensions::try_new(vec![Dimension::new("time", 2).with_meta(meta)]).unwrap();
+        let fields: Vec<Field> = names
+            .iter()
+            .map(|n| Field::new(*n, DataType::Int64, true))
+            .collect();
+        let columns = (0..names.len() as i64)
+            .map(|i| {
+                let values = Int64Array::from(vec![10 * i + 5, 10 * i + 6]);
+                NdArrowArray::try_new(Arc::new(values), dims.clone()).unwrap()
+            })
+            .collect();
+        NdRecordBatch::try_new(Arc::new(Schema::new(fields)), columns, dims).unwrap()
+    }
+
+    fn first_value(record: &NdBatchRecord) -> Option<i64> {
+        let values = record.coordinates[0].as_ref()?;
+        Some(values.as_primitive::<Int64Type>().value(0))
+    }
+
+    #[test]
+    fn a_column_with_the_axis_name_is_its_coordinate() {
+        let record = NdBatchRecord::of(0, 0, &on_time(None, &["sst", "time"]));
+        assert_eq!(first_value(&record), Some(15));
+        assert_eq!(
+            first_value(&NdBatchRecord::of(0, 0, &on_time(None, &["sst"]))),
+            None
+        );
+    }
+
+    #[test]
+    fn axis_metadata_overrides_the_convention() {
+        let off = on_time(Some(AxisMeta::no_coordinate()), &["time"]);
+        assert_eq!(first_value(&NdBatchRecord::of(0, 0, &off)), None);
+        let other = AxisMeta::coordinate("t", AxisOrder::Unordered);
+        let named = on_time(Some(other), &["time", "t"]);
+        assert_eq!(first_value(&NdBatchRecord::of(0, 0, &named)), Some(15));
+    }
+
+    #[test]
+    fn a_column_on_two_axes_is_not_a_coordinate() {
+        let time = Dimension::new("time", 2);
+        let lat = Dimension::new("lat", 1);
+        let dims = Dimensions::try_new(vec![time, lat]).unwrap();
+        let values = Int64Array::from(vec![1, 2]);
+        let column = NdArrowArray::try_new(Arc::new(values), dims.clone()).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("time", DataType::Int64, true)]));
+        let batch = NdRecordBatch::try_new(schema, vec![column], dims).unwrap();
+        assert!(NdBatchRecord::of(0, 0, &batch).coordinates[0].is_none());
+    }
+
+    #[test]
+    fn a_discovered_coordinate_names_its_column_in_the_grid() {
+        let record = NdBatchRecord::of(0, 0, &on_time(None, &["time"]));
+        let placements = finish(vec![record]).unwrap();
+        let meta = placements[0].grid().dims().get(0).meta().unwrap();
+        assert_eq!(meta.coordinate_column(), Some("time"));
+        assert_eq!(meta.order(), AxisOrder::Ascending);
     }
 }
