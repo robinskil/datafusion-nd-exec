@@ -17,6 +17,7 @@
 //! normal `RecordBatch`; `NdSourceExec` decodes
 //! it back into an [`NdRecordBatch`] on the way out.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::nd_err;
@@ -284,19 +285,81 @@ pub fn encode_flat_batch_as_nd(batch: &RecordBatch) -> Result<RecordBatch> {
 /// column is not read from a file at all — its value is in the path, and the
 /// scan always has it — so a format may encode it as the table declared it, and
 /// the table gets that column back exactly as it declared it.
+///
+/// When the encoded field records its axes, the logical field carries the nd
+/// metadata under [`ND_METADATA_KEY`], so a logical plan can see the axes of
+/// each column. See [`nd_logical_metadata`].
 pub fn logical_schema(encoded: &Schema) -> Result<SchemaRef> {
     let fields = encoded
         .fields()
         .iter()
         .map(|field| {
-            Ok(Field::new(
+            let logical = Field::new(
                 field.name(),
                 nd_value_type(field.data_type())?,
                 field.is_nullable(),
-            ))
+            );
+            let metadata = nd_field_metadata(field)
+                .filter(|m| m.dims.is_some() || !m.axes.is_empty())
+                .and_then(|m| serde_json::to_string(&m).ok())
+                .or_else(|| field.metadata().get(ND_METADATA_KEY).cloned());
+            Ok(match metadata {
+                Some(json) => {
+                    logical.with_metadata(HashMap::from([(ND_METADATA_KEY.to_string(), json)]))
+                }
+                None => logical,
+            })
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(Arc::new(Schema::new(fields)))
+}
+
+/// The field metadata key of the nd metadata of a logical field.
+pub const ND_METADATA_KEY: &str = "nd.array.metadata";
+
+/// The nd metadata of a logical field: its axis names and axis entries, or
+/// `None` when the format did not record them.
+pub fn nd_logical_metadata(field: &Field) -> Option<NdArrayMetadata> {
+    serde_json::from_str(field.metadata().get(ND_METADATA_KEY)?).ok()
+}
+
+/// The coordinate column of each axis of a logical schema, as `(axis, column)`
+/// in the order of first use.
+///
+/// An axis entry names the column, or has no column and turns the rule off.
+/// Without an entry, the field with the name of the axis is the coordinate.
+/// The column counts only when it lies on that axis alone.
+pub fn schema_coordinates(schema: &Schema) -> Vec<(String, String)> {
+    let metadata: Vec<(&str, NdArrayMetadata)> = schema
+        .fields()
+        .iter()
+        .filter_map(|f| Some((f.name().as_str(), nd_logical_metadata(f)?)))
+        .collect();
+    let mut axes: Vec<&String> = Vec::new();
+    for name in metadata.iter().flat_map(|(_, m)| m.dims.iter().flatten()) {
+        if !axes.contains(&name) {
+            axes.push(name);
+        }
+    }
+    let dims_of = |column: &str| {
+        metadata
+            .iter()
+            .find(|(name, _)| *name == column)
+            .and_then(|(_, m)| m.dims.clone())
+    };
+    axes.into_iter()
+        .filter_map(|axis| {
+            let entry = metadata
+                .iter()
+                .flat_map(|(_, m)| &m.axes)
+                .find(|e| &e.name == axis);
+            let column = match entry {
+                Some(entry) => entry.coordinate.clone()?,
+                None => axis.clone(),
+            };
+            (dims_of(&column) == Some(vec![axis.clone()])).then(|| (axis.clone(), column))
+        })
+        .collect()
 }
 
 /// Decode row 0 of an nd-encoded `RecordBatch` back into an [`NdRecordBatch`].
@@ -592,7 +655,8 @@ mod tests {
         // Materializing the decoded batch matches the original.
         let expected = nd.materialize().unwrap();
         let actual = decoded.materialize().unwrap();
-        assert_eq!(actual, expected);
+        // The decoded schema also carries the axes of each column.
+        assert_eq!(actual.columns(), expected.columns());
         assert_eq!(
             actual.column(2).as_primitive::<Float64Type>().values(),
             &[0.0, 0.1, 0.2, 1.0, 1.1, 1.2]
@@ -646,7 +710,7 @@ mod tests {
         .unwrap();
         let encoded = encode_flat_batch_as_nd(&flat).unwrap();
         let decoded = decode_nd_record_batch(&encoded).unwrap();
-        assert_eq!(decoded.materialize().unwrap(), flat);
+        assert_eq!(decoded.materialize().unwrap().columns(), flat.columns());
     }
 
     #[test]
@@ -760,5 +824,82 @@ mod tests {
         let logical = logical_schema(&encoded).unwrap();
         assert_eq!(logical.field(0).data_type(), &DataType::Int32);
         assert_eq!(logical.field(1).data_type(), &DataType::Float64);
+    }
+
+    /// A logical schema with one field per `(name, axes)`, all `Float64`.
+    fn planned(
+        columns: &[(&str, &[&str])],
+        meta: impl Fn(&str) -> Option<crate::AxisMeta>,
+    ) -> SchemaRef {
+        let encoded: Vec<Field> = columns
+            .iter()
+            .map(|(name, axes)| {
+                let dims = Dimensions::try_new(
+                    axes.iter()
+                        .map(|a| Dimension::new(*a, 1).with_meta(meta(a)))
+                        .collect(),
+                )
+                .unwrap();
+                nd_encoded_field_with_dims(&Field::new(*name, DataType::Float64, true), &dims)
+            })
+            .collect();
+        logical_schema(&Schema::new(encoded)).unwrap()
+    }
+
+    #[test]
+    fn the_logical_schema_carries_the_axes_of_each_column() {
+        let schema = planned(&[("sst", &["time", "lat"])], |_| None);
+        let metadata = nd_logical_metadata(schema.field(0)).unwrap();
+        assert_eq!(
+            metadata.dims,
+            Some(vec!["time".to_string(), "lat".to_string()])
+        );
+        // The metadata survives the round trip through the encoded schema.
+        let again = logical_schema(&encoded_schema(&schema)).unwrap();
+        assert_eq!(nd_logical_metadata(again.field(0)), Some(metadata));
+        let plain = Schema::new(vec![nd_encoded_field_of(&Field::new(
+            "x",
+            DataType::Int32,
+            true,
+        ))]);
+        assert!(nd_logical_metadata(logical_schema(&plain).unwrap().field(0)).is_none());
+    }
+
+    #[test]
+    fn a_schema_names_its_coordinates_by_convention() {
+        let schema = planned(
+            &[
+                ("time", &["time"]),
+                ("lat", &["lat"]),
+                ("sst", &["time", "lat", "lon"]),
+                ("lon", &["lon", "time"]),
+            ],
+            |_| None,
+        );
+        let expected = vec![
+            ("time".to_string(), "time".to_string()),
+            ("lat".to_string(), "lat".to_string()),
+        ];
+        assert_eq!(schema_coordinates(&schema), expected);
+    }
+
+    #[test]
+    fn axis_entries_override_the_convention_in_a_schema() {
+        let schema = planned(
+            &[
+                ("t", &["time"]),
+                ("time", &["time"]),
+                ("N_PROF", &["N_PROF"]),
+            ],
+            |axis| match axis {
+                "time" => Some(crate::AxisMeta::coordinate(
+                    "t",
+                    crate::AxisOrder::Ascending,
+                )),
+                _ => Some(crate::AxisMeta::no_coordinate()),
+            },
+        );
+        let expected = vec![("time".to_string(), "t".to_string())];
+        assert_eq!(schema_coordinates(&schema), expected);
     }
 }

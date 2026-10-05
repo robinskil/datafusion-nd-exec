@@ -103,11 +103,12 @@ impl NdProjectionExec {
         let mut fields = Vec::with_capacity(exprs.len());
         let mut columns = Vec::with_capacity(exprs.len());
         for (expr, alias) in &exprs {
-            fields.push(Field::new(
-                alias,
-                expr.data_type(&input_schema)?,
-                expr.nullable(&input_schema)?,
-            ));
+            // Keep the field metadata of the expression, as `ProjectionExec` does.
+            let field = expr.return_field(&input_schema)?;
+            fields.push(
+                Field::new(alias, field.data_type().clone(), field.is_nullable())
+                    .with_metadata(field.metadata().clone()),
+            );
             columns.push(NdExprColumn::build(&input_schema, expr)?);
         }
 
