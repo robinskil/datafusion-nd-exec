@@ -5,13 +5,13 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, UInt64Array};
 use arrow::compute::{concat, take};
-use arrow::row::{RowConverter, SortField};
+use arrow::row::{RowConverter, Rows, SortField};
 
 use super::{NdOutputGrid, NdPlacement};
 use crate::axis::{AxisMeta, AxisOrder};
 use crate::batch::NdRecordBatch;
 use crate::dimensions::{Dimension, Dimensions};
-use crate::error::{Result, nd_err};
+use crate::error::{ArrowError, Result, nd_err};
 use crate::selection::Selection;
 
 /// What the grid builder keeps of one batch: its origin, its grid and the
@@ -141,14 +141,6 @@ impl NdGridBuilder {
         self.records.len() - 1
     }
 
-    pub fn len(&self) -> usize {
-        self.records.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
-    }
-
     /// The placement of each batch, by batch number. Fails on an overlap, a
     /// null coordinate, a repeated coordinate value, or an inner axis whose
     /// coordinate column the batches do not hold.
@@ -232,7 +224,62 @@ impl NdGridBuilder {
 
     fn coordinate_axis(&self, members: &[usize], axis: usize) -> Result<OutputAxis> {
         let dim = self.records[members[0]].dims.get(axis);
-        let name = dim.name();
+        let arrays = self.coordinate_arrays(members, axis)?;
+        let converter = RowConverter::new(vec![SortField::new(arrays[0].data_type().clone())])?;
+        let refs: Vec<&dyn Array> = arrays.iter().map(|a| a.as_ref()).collect();
+        let all = concat(&refs)?;
+        let rows = converter.convert_columns(std::slice::from_ref(&all))?;
+        let lengths: Vec<usize> = arrays.iter().map(|a| a.len()).collect();
+        let order = axis_order(&rows, &lengths);
+
+        // The union of all values, sorted in `order`, without duplicates.
+        let mut union: Vec<usize> = (0..rows.num_rows()).collect();
+        union.sort_by(|&a, &b| match order {
+            AxisOrder::Descending => rows.row(b).cmp(&rows.row(a)),
+            _ => rows.row(a).cmp(&rows.row(b)),
+        });
+        union.dedup_by(|a, b| rows.row(*a) == rows.row(*b));
+        let keep = UInt64Array::from_iter_values(union.iter().map(|&i| i as u64));
+        let values = take(all.as_ref(), &keep, None)?;
+        let position: HashMap<&[u8], u64> = union
+            .iter()
+            .enumerate()
+            .map(|(out, &i)| (rows.row(i).data(), out as u64))
+            .collect();
+
+        let mut start = 0;
+        let mut positions = Vec::with_capacity(arrays.len());
+        for (&member, len) in members.iter().zip(lengths) {
+            let member_positions: Vec<u64> = (start..start + len)
+                .map(|i| position[rows.row(i).data()])
+                .collect();
+            if member_positions.iter().collect::<HashSet<_>>().len() != len {
+                return nd_err!(
+                    "the coordinate of axis '{}' repeats a value in {}",
+                    dim.name(),
+                    self.records[member].label()
+                );
+            }
+            positions.push(UInt64Array::from(member_positions));
+            start += len;
+        }
+
+        let column = dim
+            .meta()
+            .and_then(|m| m.coordinate_column())
+            .unwrap_or(dim.name());
+        Ok(OutputAxis {
+            size: values.len(),
+            meta: Some(AxisMeta::coordinate(column, order)),
+            values: Some(values),
+            positions,
+        })
+    }
+
+    /// The coordinate values of each member on `axis`. All must have one data
+    /// type and no nulls.
+    fn coordinate_arrays(&self, members: &[usize], axis: usize) -> Result<Vec<&ArrayRef>> {
+        let name = self.records[members[0]].dims.get(axis).name();
         let arrays: Vec<&ArrayRef> = members
             .iter()
             .map(|&m| {
@@ -241,10 +288,10 @@ impl NdGridBuilder {
                     .expect("checked by the caller")
             })
             .collect();
-        let data_type = arrays[0].data_type().clone();
+        let data_type = arrays[0].data_type();
         for (&member, values) in members.iter().zip(&arrays) {
             let label = self.records[member].label();
-            if values.data_type() != &data_type {
+            if values.data_type() != data_type {
                 return nd_err!(
                     "the coordinate of axis '{name}' is {} in {label}, but {data_type} in {}",
                     values.data_type(),
@@ -255,76 +302,7 @@ impl NdGridBuilder {
                 return nd_err!("the coordinate of axis '{name}' holds nulls in {label}");
             }
         }
-
-        let converter = RowConverter::new(vec![SortField::new(data_type)])?;
-        let refs: Vec<&dyn Array> = arrays.iter().map(|a| a.as_ref()).collect();
-        let all = concat(&refs)?;
-        let rows = converter.convert_columns(std::slice::from_ref(&all))?;
-
-        // Descending only when every batch with two or more values falls strictly.
-        let mut long = 0;
-        let mut falling = 0;
-        let mut start = 0;
-        for values in &arrays {
-            let end = start + values.len();
-            if values.len() >= 2 {
-                long += 1;
-                if (start + 1..end).all(|i| rows.row(i) < rows.row(i - 1)) {
-                    falling += 1;
-                }
-            }
-            start = end;
-        }
-        let descending = long > 0 && falling == long;
-
-        let mut order: Vec<usize> = (0..rows.num_rows()).collect();
-        if descending {
-            order.sort_by(|&a, &b| rows.row(b).cmp(&rows.row(a)));
-        } else {
-            order.sort_by(|&a, &b| rows.row(a).cmp(&rows.row(b)));
-        }
-        order.dedup_by(|a, b| rows.row(*a) == rows.row(*b));
-        let keep = UInt64Array::from_iter_values(order.iter().map(|&i| i as u64));
-        let values = take(all.as_ref(), &keep, None)?;
-        let position: HashMap<&[u8], u64> = order
-            .iter()
-            .enumerate()
-            .map(|(out, &i)| (rows.row(i).data(), out as u64))
-            .collect();
-
-        let mut start = 0;
-        let mut positions = Vec::with_capacity(arrays.len());
-        for (&member, values) in members.iter().zip(&arrays) {
-            let end = start + values.len();
-            let member_positions: Vec<u64> =
-                (start..end).map(|i| position[rows.row(i).data()]).collect();
-            let unique: HashSet<u64> = member_positions.iter().copied().collect();
-            if unique.len() != member_positions.len() {
-                return nd_err!(
-                    "the coordinate of axis '{name}' repeats a value in {}",
-                    self.records[member].label()
-                );
-            }
-            positions.push(UInt64Array::from(member_positions));
-            start = end;
-        }
-
-        let column = dim
-            .meta()
-            .and_then(|m| m.coordinate_column())
-            .unwrap_or(name)
-            .to_string();
-        let order = if descending {
-            AxisOrder::Descending
-        } else {
-            AxisOrder::Ascending
-        };
-        Ok(OutputAxis {
-            size: values.len(),
-            meta: Some(AxisMeta::coordinate(column, order)),
-            values: Some(values),
-            positions,
-        })
+        Ok(arrays)
     }
 
     fn plain_axis(&self, members: &[usize], axis: usize) -> OutputAxis {
@@ -363,16 +341,12 @@ impl NdGridBuilder {
                 })
                 .collect()
         };
-        let size = if axis == 0 {
-            sizes.iter().sum()
-        } else {
-            positions
-                .iter()
-                .filter_map(|p| p.values().iter().max())
-                .map(|&max| max as usize + 1)
-                .max()
-                .unwrap_or(0)
-        };
+        let size = positions
+            .iter()
+            .filter_map(|p| p.values().iter().max())
+            .map(|&max| max as usize + 1)
+            .max()
+            .unwrap_or(0);
         OutputAxis {
             size,
             meta: self.records[members[0]].dims.get(axis).meta().cloned(),
@@ -399,35 +373,75 @@ impl NdGridBuilder {
             let box_a = boxes[a].as_ref().expect("filtered");
             for &b in &order[i + 1..] {
                 let box_b = boxes[b].as_ref().expect("filtered");
+                // The members are sorted on axis 0, so no later member overlaps.
                 if let (Some(first_a), Some(first_b)) = (box_a.first(), box_b.first())
                     && first_b.0 > first_a.1
                 {
                     break;
                 }
-                let overlap = indices[a].iter().zip(&indices[b]).all(|(pa, pb)| {
-                    let set: HashSet<u64> = pa.values().iter().copied().collect();
-                    pb.values().iter().any(|p| set.contains(p))
-                });
-                if overlap {
-                    let dims = &self.records[members[a]].dims;
-                    let ranges: Vec<String> = dims
-                        .iter()
-                        .zip(box_a.iter().zip(box_b))
-                        .map(|(dim, (ra, rb))| {
-                            format!("{} {}..={}", dim.name(), ra.0.max(rb.0), ra.1.min(rb.1))
-                        })
-                        .collect();
-                    return nd_err!(
-                        "{} and {} write the same cells of the output grid: {}",
-                        self.records[members[a]].label(),
-                        self.records[members[b]].label(),
-                        ranges.join(", ")
-                    );
+                if indices[a]
+                    .iter()
+                    .zip(&indices[b])
+                    .all(|(pa, pb)| intersects(pa, pb))
+                {
+                    return Err(self.overlap_error(members[a], members[b], box_a, box_b));
                 }
             }
         }
         Ok(())
     }
+
+    fn overlap_error(
+        &self,
+        a: usize,
+        b: usize,
+        box_a: &[(u64, u64)],
+        box_b: &[(u64, u64)],
+    ) -> ArrowError {
+        let ranges: Vec<String> = self.records[a]
+            .dims
+            .iter()
+            .zip(box_a.iter().zip(box_b))
+            .map(|(dim, (ra, rb))| {
+                format!("{} {}..={}", dim.name(), ra.0.max(rb.0), ra.1.min(rb.1))
+            })
+            .collect();
+        ArrowError::InvalidArgumentError(format!(
+            "{} and {} write the same cells of the output grid: {}",
+            self.records[a].label(),
+            self.records[b].label(),
+            ranges.join(", ")
+        ))
+    }
+}
+
+/// Descending when every member with two or more values falls strictly, and
+/// at least one such member exists. Else ascending. `lengths` gives the rows
+/// of each member in `rows`, in order.
+fn axis_order(rows: &Rows, lengths: &[usize]) -> AxisOrder {
+    let mut long = 0;
+    let mut falling = 0;
+    let mut start = 0;
+    for &len in lengths {
+        if len >= 2 {
+            long += 1;
+            if (start + 1..start + len).all(|i| rows.row(i) < rows.row(i - 1)) {
+                falling += 1;
+            }
+        }
+        start += len;
+    }
+    if long > 0 && falling == long {
+        AxisOrder::Descending
+    } else {
+        AxisOrder::Ascending
+    }
+}
+
+/// True when the two position sets share a position.
+fn intersects(a: &UInt64Array, b: &UInt64Array) -> bool {
+    let set: HashSet<u64> = a.values().iter().copied().collect();
+    b.values().iter().any(|p| set.contains(p))
 }
 
 #[cfg(test)]

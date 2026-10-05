@@ -184,49 +184,17 @@ impl Collector {
             ..
         } = self;
         let placements = builder.finish()?;
-
-        // Count each grid once: its batches share one `Arc`.
-        let mut seen: HashSet<*const NdOutputGrid> = HashSet::new();
-        let cells: usize = placements
-            .iter()
-            .filter(|p| seen.insert(Arc::as_ptr(p.grid())))
-            .map(|p| p.grid().num_cells())
-            .sum();
-        MetricBuilder::new(metrics)
-            .global_counter("grids")
-            .add(seen.len());
-        MetricBuilder::new(metrics)
-            .global_counter("output_cells")
-            .add(cells);
+        record_grids(metrics, &placements);
 
         let place = Arc::new(Place {
             schema,
             targets,
             placements,
         });
-        let mut parts: Vec<SendableNdBatchStream> = Vec::new();
-        for (file, ids) in spills {
-            let encoded = spill.read_spill_as_stream(file, None)?;
-            let place = place.clone();
-            let mut ids = ids.into_iter();
-            let decoded = encoded
-                .map(move |encoded| -> Result<Vec<Result<NdRecordBatch>>> {
-                    let encoded = encoded?;
-                    (0..nd_batch_count(&encoded))
-                        .map(|row| {
-                            let id = ids.next().ok_or_else(|| {
-                                DataFusionError::Internal(
-                                    "a spill file holds more batches than records".to_string(),
-                                )
-                            })?;
-                            Ok(place.restore(id, decode_nd_record_batch_row(&encoded, row)?))
-                        })
-                        .collect()
-                })
-                .map_ok(futures::stream::iter)
-                .try_flatten();
-            parts.push(Box::pin(decoded));
-        }
+        let mut parts = spills
+            .into_iter()
+            .map(|(file, ids)| read_spill(&spill, file, ids, place.clone()))
+            .collect::<Result<Vec<_>>>()?;
         let place_held = place.clone();
         parts.push(Box::pin(futures::stream::iter(
             held.into_iter()
@@ -238,6 +206,52 @@ impl Collector {
         });
         Ok(Box::pin(stream))
     }
+}
+
+/// Record the number of grids and output cells. The batches of one grid share
+/// one `Arc`, so each grid counts once.
+fn record_grids(metrics: &ExecutionPlanMetricsSet, placements: &[Arc<NdPlacement>]) {
+    let mut seen: HashSet<*const NdOutputGrid> = HashSet::new();
+    let cells: usize = placements
+        .iter()
+        .filter(|p| seen.insert(Arc::as_ptr(p.grid())))
+        .map(|p| p.grid().num_cells())
+        .sum();
+    MetricBuilder::new(metrics)
+        .global_counter("grids")
+        .add(seen.len());
+    MetricBuilder::new(metrics)
+        .global_counter("output_cells")
+        .add(cells);
+}
+
+/// The batches of one spill file, decoded and placed, in file order. `ids`
+/// holds the batch numbers of the file, in order.
+fn read_spill(
+    spill: &SpillManager,
+    file: RefCountedTempFile,
+    ids: Vec<usize>,
+    place: Arc<Place>,
+) -> Result<SendableNdBatchStream> {
+    let mut ids = ids.into_iter();
+    let decoded = spill
+        .read_spill_as_stream(file, None)?
+        .map(move |encoded| -> Result<Vec<Result<NdRecordBatch>>> {
+            let encoded = encoded?;
+            (0..nd_batch_count(&encoded))
+                .map(|row| {
+                    let id = ids.next().ok_or_else(|| {
+                        DataFusionError::Internal(
+                            "a spill file holds more batches than records".to_string(),
+                        )
+                    })?;
+                    Ok(place.restore(id, decode_nd_record_batch_row(&encoded, row)?))
+                })
+                .collect()
+        })
+        .map_ok(futures::stream::iter)
+        .try_flatten();
+    Ok(Box::pin(decoded))
 }
 
 /// The places of all batches, and the grid of each batch for the restore.
