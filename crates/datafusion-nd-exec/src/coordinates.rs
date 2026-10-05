@@ -16,9 +16,9 @@ use nd_arrow_array::encoding::{nd_logical_metadata, schema_coordinates};
 ///
 /// The coordinate columns come from the schemas of the table scans, with
 /// [`schema_coordinates`]. The axes of the output come from the field
-/// metadata of its columns, so a computed column adds no axes. Each missing
-/// column goes at the end of the top projection, under its own name. Without
-/// such a projection, the plan does not change.
+/// metadata of its columns, so a computed column adds no axes. Each column
+/// that the output lacks goes at the end of the top projection, under its own
+/// name. Without such a projection, the plan does not change.
 ///
 /// Use it on a logical plan before the optimizer, where a projection still
 /// sees all columns of its input.

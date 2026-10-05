@@ -30,7 +30,7 @@ grid too.
 | Crate | Content | Depends on |
 |---|---|---|
 | `nd-arrow-array` | The nd data types: `NdArrowArray`, `NdRecordBatch`, `Dimensions` with axis metadata, the `Selection` lattice, `BroadcastMap`, the `nd.array` Arrow extension type with its encoding, and the output grids: `NdOutputGrid`, `NdPlacement` and `NdGridBuilder`. | `arrow` |
-| `datafusion-nd-exec` | The nd plan nodes, the node registry, the `NdBoundaryRule`, the output terminals, the regrid step, axis ranges for readers, and a test harness (feature `test-utils`). It re-exports `nd-arrow-array` as `datafusion_nd_exec::array`. | `nd-arrow-array`, `datafusion` |
+| `datafusion-nd-exec` | The nd plan nodes, the node registry, the `NdBoundaryRule`, the output terminals, the regrid step, the `NdGridCoordinatesRule` for grid writes, axis ranges for readers, and a test harness (feature `test-utils`). It re-exports `nd-arrow-array` as `datafusion_nd_exec::array`. | `nd-arrow-array`, `datafusion` |
 
 Both crates target DataFusion 53 and Arrow 58.
 
@@ -225,8 +225,10 @@ complete, runnable version is
 
 2. **Encode each chunk** with `encode_nd_record_batch`. Each encoded row
    carries one chunk. All chunks of a scan must carry the same encoded schema.
-   For a sort order, build the encoded schema with `nd_encoded_field_with_dims`,
-   so the fields record the axes of each column.
+   Build the encoded schema with `nd_encoded_field_with_dims`, so the fields
+   record the axes of each column. `logical_schema` then copies the axes into
+   the table schema, under the field metadata key `nd.array.metadata`. A sort
+   order and the `NdGridCoordinatesRule` read them there, at plan time.
 
 3. **Plan the scan:**
 
@@ -375,6 +377,26 @@ so a host can use it without DataFusion.
    ```
 
    Or plan the write yourself: `NdDataSinkExec::try_new(nd_child_of_the_boundary, sink)`.
+
+   For `COPY TO`, also add the `NdGridCoordinatesRule`. It adds the coordinate
+   columns that the query lacks, so `COPY (SELECT sst FROM t) TO ...` writes
+   `time`, `lat` and `lon` too. The predicate selects the grid writes:
+
+   ```rust
+   let rule = NdGridCoordinatesRule::new(|copy| copy.output_url.ends_with(".zarr"));
+   let state = SessionStateBuilder::new()
+       .with_default_features()
+       .with_nd_pipeline(registry)
+       .with_analyzer_rule(Arc::new(rule))
+       .build();
+   ```
+
+   The rule reads the coordinate columns of each table scan from the table
+   schema, with `schema_coordinates`, and the axes of each output column from
+   its field metadata. It adds each coordinate column that the output lacks at the end of the
+   top projection. A computed column, such as `sst * 2`, adds no axes. For
+   another plan, call `add_grid_coordinates(plan)` on the logical plan before
+   the optimizer.
 5. **Set the memory.** `NdRegridExec` holds the chunks until the input ends, and spills when the memory pool is full. Give the session a memory limit and a disk manager, for example `RuntimeEnvBuilder::new().with_memory_limit(4 << 30, 1.0)`. The default disk manager writes the spill files to the temp directory of the OS.
 
 `testing::MemoryGridSink` follows these steps in memory, and
@@ -401,10 +423,10 @@ name of the axis. `AxisMeta::coordinate(column, …)` names another column, and
 - Each inner axis keeps the original index of each kept cell. A filter that keeps `N_LEVELS [2, 3]` writes levels 2 and 3, not 0 and 1. The output size is the largest index plus 1, over all chunks.
 
 The original index is correct when all chunks share one grid on that axis.
-When the grids differ, only a coordinate can place the chunks, so select the
-coordinate column. An inner axis whose metadata names a coordinate column,
-but whose chunks do not hold it, causes a failure, and the error asks for the
-column.
+When the grids differ, only a coordinate can place the chunks, so the query
+must hold the coordinate column. The `NdGridCoordinatesRule` adds it to a grid
+`COPY TO`. An inner axis whose metadata names a coordinate column, but whose
+chunks do not hold it, causes a failure, and the error asks for the column.
 
 **Sparse grids:** each cell that no chunk writes is null. So chunks with
 other grids, for example two regions, fill one union grid.
@@ -420,11 +442,11 @@ spatial tiles can write the same `time` values.
 other days. The query:
 
 ```sql
-COPY (SELECT time, lat, lon, sst FROM stores WHERE time >= '2020-01-01') TO 'all.zarr'
+COPY (SELECT sst FROM stores WHERE time >= '2020-01-01') TO 'all.zarr'
 ```
 
 1. The Zarr reader yields chunks with the axes `time`, `lat` and `lon`. The arrays `time`, `lat` and `lon` have the names of their axes, so they are the coordinates, with no axis metadata. The reader can skip the stores and chunks before 2020 with `axis_ranges`.
-2. The `NdSinkFactory` of the host maps the `COPY TO` sink to a Zarr grid sink. The plan is `NdDataSinkExec` over `NdRegridExec` over the nd region.
+2. The `NdGridCoordinatesRule` adds `time`, `lat` and `lon` to the query, because `sst` lies on those axes. The `NdSinkFactory` of the host maps the `COPY TO` sink to a Zarr grid sink. The plan is `NdDataSinkExec` over `NdRegridExec` over the nd region.
 3. `NdRegridExec` collects all chunks and spills them when the memory is full. Only the records of the chunks stay in memory: their axis sizes and coordinate values.
 4. The regrid joins the days of all stores into one sorted `time` axis. `lat` and `lon` are equal in all stores, so the union keeps them as they are. Two stores with the same day fail with an overlap error.
 5. The sink creates `all.zarr` with the shape `[days, lat, lon]` and writes `time`, `lat` and `lon` from the grid. Then it writes each chunk at its `time` positions.
@@ -496,7 +518,7 @@ cargo run -p datafusion-nd-exec --example profiles
 
 - A grid sink writes nothing until its input ends. Spilled chunks go to disk once and come back once. The input must be bounded.
 - `NdRegridExec` sends whole chunks, not blocks that match the storage chunks of the output. A Zarr sink must read, change and write a storage chunk again when a chunk covers only part of it.
-- A grid sink needs the coordinate column of each inner axis in the query when the grids of the chunks differ on that axis. The plan does not add a coordinate column that the query lacks.
+- A grid sink needs the coordinate column of each inner axis in the query when the grids of the chunks differ on that axis. Only the `NdGridCoordinatesRule` adds a column that the query lacks, and only to a `COPY TO` with a top projection. An `INSERT` and an `NdDataSinkExec` that a host plans itself get no columns.
 - The spatial box of `st_within` and `st_intersects` does not narrow axes yet.
 - `NdRepartitionExec` uses unbounded channels, so memory is not limited when a consumer is slow.
 - A filter adds a round-robin repartition, which loses the order, so `WHERE ... ORDER BY time` still sorts. The flat path does the same.
