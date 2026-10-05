@@ -300,9 +300,9 @@ mod tests {
         );
     }
 
-    /// The pushdown rule adopts the original `ProjectionExec`'s schema verbatim;
-    /// a schema that disagrees on types with the expressions must be refused, or
-    /// the rewrite would silently change the plan's output type.
+    /// `ProjectionSinker` passes the schema of the `ProjectionExec` as it is. A
+    /// schema whose types differ from the expressions must fail, else the
+    /// rewrite changes the output type of the plan.
     #[test]
     fn a_type_incompatible_output_schema_is_rejected() {
         let schema = test_schema();

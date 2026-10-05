@@ -27,7 +27,7 @@ pub struct BroadcastMap {
 impl BroadcastMap {
     /// Build the broadcast of `source` onto `target`.
     ///
-    /// Rules (matching `beacon-nd-array`'s `permuted_axes`-based broadcast):
+    /// Rules:
     /// - every source dimension must appear in `target` (matched by name;
     ///   reordering is allowed and expressed through the strides);
     /// - a source axis must have the same size as the target axis, or size 1
@@ -244,8 +244,7 @@ mod tests {
 
     #[test]
     fn transposed_dims_gather_correctly() {
-        // Source stored (lon, time); target order (time, lon). Matching
-        // beacon-nd-array's permuted_axes broadcast, the view transposes.
+        // Source stored (lon, time), target order (time, lon): the view transposes.
         let map = BroadcastMap::try_new(
             &dims(&[("lon", 3), ("time", 2)]),
             &dims(&[("time", 2), ("lon", 3)]),

@@ -196,9 +196,8 @@ mod tests {
 
     use super::*;
 
-    /// A minimal element-wise scalar function that sums all its Int32 arguments
-    /// (arrays and/or scalars) row-wise — enough to exercise evaluation over
-    /// functions without pulling in datafusion-functions.
+    /// An element-wise scalar function that sums its Int32 arguments (arrays
+    /// or scalars) per row. It tests a function with several arguments.
     #[derive(Debug, PartialEq, Eq, Hash)]
     struct SumUdf {
         signature: Signature,

@@ -375,7 +375,7 @@ so a host can use it without DataFusion.
        .build();
    ```
 
-   Or plan the write yourself: `NdDataSinkExec::try_new(nd_child_of_the_boundary, sink)`.
+   Or plan the write yourself: `NdDataSinkExec::try_new(nd_child_of_the_boundary, sink, registry)`.
 
    For `COPY TO`, also add the `NdGridCoordinatesRule`. It adds the coordinate
    columns that the query lacks, so `COPY (SELECT sst FROM t) TO ...` writes
