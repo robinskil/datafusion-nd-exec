@@ -4,7 +4,7 @@ use std::any::Any;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use arrow::array::{Array, ArrayRef, new_null_array};
+use arrow::array::{Array, ArrayRef, UInt64Array, new_null_array};
 use arrow::compute::interleave;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -12,70 +12,36 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
 use futures::StreamExt;
-use nd_arrow_array::{Dimension, Dimensions, NdArrowArray, NdRecordBatch};
+use nd_arrow_array::{Dimension, Dimensions, NdArrowArray, NdOutputGrid, NdRecordBatch};
 
 use crate::exec::SendableNdBatchStream;
-use crate::sink::{AxisMode, NdDataSink, NdGridAccumulator, Placement};
+use crate::sink::NdDataSink;
 
-/// An [`NdDataSink`] that places each chunk with the [`NdGridAccumulator`]
-/// and builds the dense output grid in memory. A cell that no chunk writes is
-/// null.
+/// An [`NdDataSink`] that builds each dense output grid in memory from the
+/// placements of the regrid step. A cell that no batch writes is null.
 #[derive(Debug)]
 pub struct MemoryGridSink {
     schema: SchemaRef,
-    modes: Vec<(String, AxisMode)>,
-    growth_axis: Option<String>,
-    seeds: Vec<(String, ArrayRef)>,
-    grid: Mutex<Option<NdRecordBatch>>,
+    grids: Mutex<Vec<NdRecordBatch>>,
 }
 
 impl MemoryGridSink {
     pub fn new(schema: SchemaRef) -> Self {
         Self {
             schema,
-            modes: Vec::new(),
-            growth_axis: None,
-            seeds: Vec::new(),
-            grid: Mutex::new(None),
+            grids: Mutex::new(Vec::new()),
         }
     }
 
-    /// Set the accumulator mode of the axis `axis`.
-    pub fn with_mode(mut self, axis: impl Into<String>, mode: AxisMode) -> Self {
-        self.modes.push((axis.into(), mode));
-        self
-    }
-
-    /// Set the growth axis of the accumulator.
-    pub fn with_growth_axis(mut self, axis: impl Into<String>) -> Self {
-        self.growth_axis = Some(axis.into());
-        self
-    }
-
-    /// Seed the coordinate of the axis `axis`, see
-    /// [`NdGridAccumulator::with_coordinate`].
-    pub fn with_coordinate(mut self, axis: impl Into<String>, values: ArrayRef) -> Self {
-        self.seeds.push((axis.into(), values));
-        self
-    }
-
-    fn accumulator(&self) -> NdGridAccumulator {
-        let mut acc = NdGridAccumulator::new();
-        for (axis, mode) in &self.modes {
-            acc = acc.with_mode(axis.clone(), *mode);
-        }
-        if let Some(axis) = &self.growth_axis {
-            acc = acc.with_growth_axis(axis.clone());
-        }
-        for (axis, values) in &self.seeds {
-            acc = acc.with_coordinate(axis.clone(), values.clone());
-        }
-        acc
-    }
-
-    /// The output grid of the last `write_all`.
+    /// The first output grid of the last `write_all`.
     pub fn grid(&self) -> Option<NdRecordBatch> {
-        self.grid.lock().expect("grid lock").clone()
+        self.grids().into_iter().next()
+    }
+
+    /// All output grids of the last `write_all`, in the order of their first
+    /// batch.
+    pub fn grids(&self) -> Vec<NdRecordBatch> {
+        self.grids.lock().expect("grid lock").clone()
     }
 }
 
@@ -95,138 +61,134 @@ impl NdDataSink for MemoryGridSink {
         &self.schema
     }
 
+    fn requires_grid(&self) -> bool {
+        true
+    }
+
     async fn write_all(
         &self,
         mut data: SendableNdBatchStream,
         _context: &Arc<TaskContext>,
     ) -> Result<u64> {
-        let mut accumulator = self.accumulator();
-        let mut placements = Vec::new();
+        let mut groups: Vec<(Arc<NdOutputGrid>, Vec<NdRecordBatch>)> = Vec::new();
+        let mut rows = 0;
         while let Some(batch) = data.next().await {
-            placements.push(accumulator.place(&batch?)?);
+            let batch = batch?;
+            let grid = batch
+                .placement()
+                .ok_or_else(|| {
+                    DataFusionError::Execution("MemoryGridSink needs placed batches".to_string())
+                })?
+                .grid()
+                .clone();
+            rows += batch.num_rows() as u64;
+            match groups.iter_mut().find(|(g, _)| Arc::ptr_eq(g, &grid)) {
+                Some((_, batches)) => batches.push(batch),
+                None => groups.push((grid, vec![batch])),
+            }
         }
-        let rows = placements.iter().map(|p| p.batch.num_rows() as u64).sum();
-        let grid = build_grid(&self.schema, &accumulator, &placements)?;
-        *self.grid.lock().expect("grid lock") = grid;
+        let grids = groups
+            .iter()
+            .map(|(grid, batches)| build_grid(&self.schema, grid, batches))
+            .collect::<Result<Vec<_>>>()?;
+        *self.grids.lock().expect("grid lock") = grids;
         Ok(rows)
     }
 }
 
-/// The dense output grid of all placements, or `None` without placements.
+/// The dense output grid of `batches`.
 fn build_grid(
     schema: &SchemaRef,
-    accumulator: &NdGridAccumulator,
-    placements: &[Placement],
-) -> Result<Option<NdRecordBatch>> {
-    let Some(first) = placements.first() else {
-        return Ok(None);
-    };
-    let extents = accumulator.extents();
-    let meta_of = |name: &str| {
-        first
-            .batch
-            .target()
-            .iter()
-            .find(|d| d.name() == name)
-            .and_then(|d| d.meta().cloned())
-    };
-    let target = Dimensions::try_new(
-        extents
-            .iter()
-            .map(|(name, size)| Dimension::new(name.as_str(), *size).with_meta(meta_of(name)))
-            .collect(),
-    )?;
+    grid: &NdOutputGrid,
+    batches: &[NdRecordBatch],
+) -> Result<NdRecordBatch> {
+    let target = grid.dims().clone();
     let columns = schema
         .fields()
         .iter()
         .enumerate()
         .map(|(index, field)| {
-            // A seeded coordinate comes from its seed, so a value that no
-            // chunk holds is not null.
-            let seeded = extents.iter().find_map(|(axis, _)| {
-                (accumulator.coordinate_column(axis) == Some(field.name().as_str()))
-                    .then(|| accumulator.coordinate_seed(axis).map(|seed| (axis, seed)))
-                    .flatten()
-            });
-            match seeded {
-                Some((axis, seed)) => {
-                    let dims = Dimensions::try_new(vec![
-                        target
-                            .get(target.position(axis).expect("output axis"))
-                            .clone(),
-                    ])?;
-                    Ok(NdArrowArray::try_new(seed.clone(), dims)?)
-                }
-                None => build_column(index, &target, placements),
+            // A coordinate comes from the grid, so each step has a value.
+            let coordinate = target
+                .iter()
+                .zip(grid.coordinates())
+                .find_map(|(dim, values)| {
+                    let values = values.as_ref()?;
+                    (dim.meta()?.coordinate_column()? == field.name())
+                        .then(|| (dim.clone(), values.clone()))
+                });
+            match coordinate {
+                Some((dim, values)) => Ok(NdArrowArray::try_new(
+                    values,
+                    Dimensions::try_new(vec![dim])?,
+                )?),
+                None => build_column(index, &target, batches),
             }
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(Some(NdRecordBatch::try_new(
-        schema.clone(),
-        columns,
-        target,
-    )?))
+    Ok(NdRecordBatch::try_new(schema.clone(), columns, target)?)
 }
 
-/// One output column: each output cell takes the value of the last chunk that
+/// One output column: each output cell takes the value of the batch that
 /// writes it.
 ///
-/// The column has the axes of the chunk where it has the most axes. A chunk
+/// The column has the axes of the batch where it has the most axes. A batch
 /// where it has fewer axes, for example a scalar null for a file that lacks
 /// the column, broadcasts its values over its own block.
 fn build_column(
     index: usize,
     target: &Dimensions,
-    placements: &[Placement],
+    batches: &[NdRecordBatch],
 ) -> Result<NdArrowArray> {
-    let widest = placements
+    let widest = batches
         .iter()
-        .map(|p| p.batch.column(index))
+        .map(|b| b.column(index))
         .max_by_key(|column| column.dims().rank())
-        .expect("at least one placement");
+        .expect("at least one batch");
     let names: Vec<&str> = widest.dims().iter().map(|d| d.name()).collect();
-    let axis_of = |name: &str| {
-        target.position(name).ok_or_else(|| {
-            DataFusionError::Execution(format!("column axis '{name}' is not an output axis"))
-        })
-    };
     let dims = Dimensions::try_new(
         names
             .iter()
-            .map(|name| Ok(target.get(axis_of(name)?).clone()))
+            .map(|name| {
+                let axis = target.position(name).ok_or_else(|| {
+                    DataFusionError::Execution(format!("column axis '{name}' is not a grid axis"))
+                })?;
+                Ok(target.get(axis).clone())
+            })
             .collect::<Result<Vec<_>>>()?,
     )?;
     let strides = dims.c_strides();
 
-    // The source of each output cell: (placement, index), or the null source.
-    let null_source = placements.len();
+    // The source of each output cell: (batch, index), or the null source.
+    let null_source = batches.len();
     let mut sources = vec![(null_source, 0usize); dims.num_elements()];
-    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(placements.len() + 1);
-    for (k, placement) in placements.iter().enumerate() {
-        // The block of the chunk on the column axes, in output axis order.
-        let block_axes: Vec<&crate::sink::AxisPlacement> = names
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(batches.len() + 1);
+    for (k, batch) in batches.iter().enumerate() {
+        let placement = batch.placement().expect("checked in write_all");
+        let positions: Vec<&UInt64Array> = names
             .iter()
             .map(|name| {
-                placement.axis(name).ok_or_else(|| {
-                    DataFusionError::Execution(format!("the chunk has no placement for '{name}'"))
+                placement.axis_indices(name).ok_or_else(|| {
+                    DataFusionError::Execution(format!("the placement has no axis '{name}'"))
                 })
             })
             .collect::<Result<Vec<_>>>()?;
         let block = Dimensions::try_new(
-            block_axes
+            names
                 .iter()
-                .map(|axis| Dimension::new(axis.name.as_str(), axis.len))
+                .zip(&positions)
+                .map(|(name, p)| Dimension::new(*name, p.len()))
                 .collect(),
         )?;
-        arrays.push(placement.batch.column(index).materialize(&block)?);
+        arrays.push(batch.column(index).materialize(&block)?);
         let block_strides = block.c_strides();
         for cell in 0..block.num_elements() {
-            let out: usize = block_axes
+            let out: usize = positions
                 .iter()
                 .enumerate()
-                .map(|(axis, placed)| {
-                    let coord = (cell / block_strides[axis]) % placed.len;
-                    (placed.offset + coord) * strides[axis]
+                .map(|(axis, p)| {
+                    let coord = (cell / block_strides[axis]) % p.len();
+                    p.value(coord) as usize * strides[axis]
                 })
                 .sum();
             sources[out] = (k, cell);
@@ -241,7 +203,7 @@ fn build_column(
 mod tests {
     use arrow::array::{AsArray, Float64Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Float64Type, Schema};
-    use nd_arrow_array::{AxisMeta, AxisOrder};
+    use nd_arrow_array::{AxisMeta, AxisOrder, NdBatchRecord, NdGridBuilder};
 
     use super::*;
 
@@ -270,16 +232,27 @@ mod tests {
 
     #[tokio::test]
     async fn a_file_without_the_column_writes_nulls() {
-        let first = chunk(vec![100, 101], None);
-        let schema = first.schema().clone();
+        let chunks = vec![
+            chunk(vec![100, 101], None),
+            chunk(vec![102], Some(vec![1.5])),
+        ];
+        let schema = chunks[0].schema().clone();
+        let mut builder = NdGridBuilder::new();
+        for (number, batch) in chunks.iter().enumerate() {
+            builder.add(NdBatchRecord::of(0, number, batch));
+        }
+        let placed: Vec<Result<NdRecordBatch>> = chunks
+            .into_iter()
+            .zip(builder.finish().unwrap())
+            .map(|(batch, place)| Ok(batch.with_placement(place)?))
+            .collect();
         let sink = MemoryGridSink::new(schema);
-        let data: SendableNdBatchStream = Box::pin(futures::stream::iter(vec![
-            Ok(first),
-            Ok(chunk(vec![102], Some(vec![1.5]))),
-        ]));
-        sink.write_all(data, &Arc::new(TaskContext::default()))
-            .await
-            .unwrap();
+        sink.write_all(
+            Box::pin(futures::stream::iter(placed)),
+            &Arc::new(TaskContext::default()),
+        )
+        .await
+        .unwrap();
 
         let grid = sink.grid().unwrap();
         let sst = grid.column(1);

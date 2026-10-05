@@ -20,17 +20,24 @@ use datafusion::physical_plan::{
 
 use crate::exec::{NdExecutionPlan, SendableNdBatchStream, merge_partitions, require_nd_input};
 use crate::registry::NdNodeRegistry;
+use crate::sink::NdRegridExec;
 
 /// A writer that takes nd batches, so the grid reaches the output. A grid
-/// format implements it with the [`NdGridAccumulator`] and its own writer.
-///
-/// [`NdGridAccumulator`]: crate::sink::NdGridAccumulator
+/// format sets [`requires_grid`](Self::requires_grid) and writes each batch at
+/// its placement.
 #[async_trait]
 pub trait NdDataSink: DisplayAs + fmt::Debug + Send + Sync {
     fn as_any(&self) -> &dyn Any;
 
     /// The schema of the nd batches.
     fn schema(&self) -> &SchemaRef;
+
+    /// True when the sink needs the full output grid and the place of each
+    /// batch. [`NdDataSinkExec`] then reads the input through an
+    /// [`NdRegridExec`], and each batch carries its placement.
+    fn requires_grid(&self) -> bool {
+        false
+    }
 
     /// Write all batches of `data` and return the number of rows written.
     async fn write_all(
@@ -80,6 +87,16 @@ impl NdDataSinkExec {
         sink: Arc<dyn NdDataSink>,
         registry: Arc<NdNodeRegistry>,
     ) -> Result<Self> {
+        // A grid sink reads its batches through the regrid step.
+        let input: Arc<dyn ExecutionPlan> =
+            if sink.requires_grid() && !input.as_any().is::<NdRegridExec>() {
+                Arc::new(NdRegridExec::try_new_with_registry(
+                    input,
+                    registry.clone(),
+                )?)
+            } else {
+                input
+            };
         let nd_input = require_nd_input("NdDataSinkExec", &input, &registry)?;
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(count_schema()),

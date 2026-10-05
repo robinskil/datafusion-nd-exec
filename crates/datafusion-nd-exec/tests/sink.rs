@@ -16,8 +16,10 @@ use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream, collect, displayable,
 };
-use datafusion_nd_exec::sink::{AxisMode, NdDataSink, NdDataSinkExec, NdSinkFactory};
-use datafusion_nd_exec::testing::{MemoryGridSink, grid_table, profile_table, sorted_rows};
+use datafusion_nd_exec::sink::{NdDataSink, NdDataSinkExec, NdSinkFactory};
+use datafusion_nd_exec::testing::{
+    MemoryGridSink, NdMemTable, grid_table, profile_table, sorted_rows,
+};
 use datafusion_nd_exec::{NdBoundaryRule, NdNodeRegistry};
 
 /// The count of the one row that a sink yields.
@@ -73,11 +75,7 @@ async fn profiles_append_and_pad_in_the_sink() -> Result<()> {
     let schema = table
         .nd_scan(None, NdNodeRegistry::shared_default())?
         .schema();
-    let sink = Arc::new(
-        MemoryGridSink::new(schema)
-            .with_mode("N_PROF", AxisMode::Append)
-            .with_mode("N_LEVELS", AxisMode::Pad),
-    );
+    let sink = Arc::new(MemoryGridSink::new(schema));
     let rows = run(Arc::new(NdDataSinkExec::try_new(
         nd_scan(&table)?,
         sink.clone(),
@@ -99,35 +97,95 @@ async fn profiles_append_and_pad_in_the_sink() -> Result<()> {
 }
 
 #[tokio::test]
-async fn a_seeded_growth_axis_comes_out_sorted() -> Result<()> {
-    use arrow::array::Int64Array;
+async fn chunks_in_reverse_order_come_out_sorted() -> Result<()> {
     use arrow::datatypes::Int64Type;
 
     let table = grid_table()?;
     let schema = table
         .nd_scan(None, NdNodeRegistry::shared_default())?
         .schema();
-    // The seed holds one more time step than the data.
-    let seed = Arc::new(Int64Array::from(vec![103, 104, 100, 102, 101]));
-    let sink = Arc::new(MemoryGridSink::new(schema).with_coordinate("time", seed));
+    let reversed = NdMemTable::try_new(table.partitions().iter().rev().cloned().collect())?;
+
+    let in_order = Arc::new(MemoryGridSink::new(schema.clone()));
     run(Arc::new(NdDataSinkExec::try_new(
         nd_scan(&table)?,
-        sink.clone(),
+        in_order.clone(),
+    )?))
+    .await?;
+    let backward = Arc::new(MemoryGridSink::new(schema));
+    run(Arc::new(NdDataSinkExec::try_new(
+        nd_scan(&reversed)?,
+        backward.clone(),
     )?))
     .await?;
 
-    let grid = sink.grid().unwrap();
+    let grid = backward.grid().unwrap();
     let time = grid.column(0).values().as_primitive::<Int64Type>();
-    assert_eq!(time.values(), &[100, 101, 102, 103, 104]);
-    // No chunk writes time step 104, so its cells are null.
-    let sst = grid.column(3).values();
-    let per_step = 3 * 2;
+    assert_eq!(time.values(), &[100, 101, 102, 103]);
     assert_eq!(
-        (4 * per_step..5 * per_step)
-            .filter(|&i| sst.is_null(i))
-            .count(),
-        per_step
+        grid.column(3).values(),
+        in_order.grid().unwrap().column(3).values()
     );
+    Ok(())
+}
+
+/// An nd sink that counts rows and needs no grid.
+#[derive(Debug)]
+struct CountingSink {
+    schema: SchemaRef,
+}
+
+impl DisplayAs for CountingSink {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CountingSink")
+    }
+}
+
+#[async_trait]
+impl NdDataSink for CountingSink {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    async fn write_all(
+        &self,
+        mut data: datafusion_nd_exec::exec::SendableNdBatchStream,
+        _context: &Arc<TaskContext>,
+    ) -> Result<u64> {
+        let mut rows = 0;
+        while let Some(batch) = futures::StreamExt::next(&mut data).await {
+            rows += batch?.num_rows() as u64;
+        }
+        Ok(rows)
+    }
+}
+
+#[tokio::test]
+async fn only_a_grid_sink_reads_through_the_regrid_step() -> Result<()> {
+    let table = grid_table()?;
+    let schema = table
+        .nd_scan(None, NdNodeRegistry::shared_default())?
+        .schema();
+    let grid_sink = NdDataSinkExec::try_new(
+        nd_scan(&table)?,
+        Arc::new(MemoryGridSink::new(schema.clone())),
+    )?;
+    let lines = displayable(&grid_sink).indent(true).to_string();
+    let lines: Vec<&str> = lines.lines().map(str::trim).collect();
+    assert_eq!(lines[0], "NdDataSinkExec: sink=MemoryGridSink");
+    assert_eq!(lines[1], "NdRegridExec");
+
+    let counting = Arc::new(NdDataSinkExec::try_new(
+        nd_scan(&table)?,
+        Arc::new(CountingSink { schema }),
+    )?);
+    let rendered = displayable(counting.as_ref()).indent(true).to_string();
+    assert!(!rendered.contains("NdRegridExec"), "{rendered}");
+    assert_eq!(run(counting).await?, 24);
     Ok(())
 }
 

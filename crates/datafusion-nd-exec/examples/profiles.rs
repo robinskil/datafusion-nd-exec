@@ -24,7 +24,7 @@ use datafusion::prelude::SessionContext;
 use datafusion_nd_exec::array::encoding::{encode_nd_record_batch, logical_schema};
 use datafusion_nd_exec::array::{AxisMeta, Dimension, Dimensions, NdArrowArray, NdRecordBatch};
 use datafusion_nd_exec::exec::{NdBroadcastExec, NdSourceExec, SendableNdBatchStream};
-use datafusion_nd_exec::sink::{AxisMode, NdDataSink, NdDataSinkExec, NdGridAccumulator};
+use datafusion_nd_exec::sink::{NdDataSink, NdDataSinkExec};
 use datafusion_nd_exec::{NdNodeRegistry, NdSessionStateBuilderExt};
 use futures::StreamExt;
 
@@ -128,8 +128,8 @@ impl TableProvider for ProfileFiles {
     }
 }
 
-/// A toy grid writer: it places each chunk and prints where it goes. A netCDF
-/// or Zarr writer writes the chunk at that place instead.
+/// A toy grid writer: it prints the grid and the place of each chunk. A
+/// netCDF or Zarr writer writes the chunk at that place instead.
 #[derive(Debug)]
 struct PrintingGridSink {
     schema: SchemaRef,
@@ -151,36 +151,51 @@ impl NdDataSink for PrintingGridSink {
         &self.schema
     }
 
+    fn requires_grid(&self) -> bool {
+        true
+    }
+
     async fn write_all(
         &self,
         mut data: SendableNdBatchStream,
         _context: &Arc<TaskContext>,
     ) -> Result<u64> {
-        // `N_PROF` is the outer axis, so it is the growth axis and appends.
-        // `N_LEVELS` differs per file and has no coordinate, so it pads.
-        let mut accumulator = NdGridAccumulator::new().with_mode("N_LEVELS", AxisMode::Pad);
+        // `N_PROF` is the outer axis without a coordinate, so it appends.
+        // `N_LEVELS` pads to its largest size.
         let mut rows = 0;
+        let mut printed = false;
         while let Some(chunk) = data.next().await {
-            let placement = accumulator.place(&chunk?)?;
+            let chunk = chunk?;
+            let placement = chunk.placement().expect("a grid sink gets placed batches");
+            if !printed {
+                // A writer writes the grid metadata before the first chunk.
+                println!("output grid: {}", describe(placement.grid().dims()));
+                printed = true;
+            }
             let axes: Vec<String> = placement
-                .axes
+                .grid()
+                .dims()
                 .iter()
-                .map(|a| {
-                    format!(
-                        "{} {}..{} of {}",
-                        a.name,
-                        a.offset,
-                        a.offset + a.len,
-                        a.extent
-                    )
+                .zip(placement.indices())
+                .map(|(dim, positions)| {
+                    let first = positions.values().first().copied().unwrap_or(0);
+                    let last = positions.values().last().copied().unwrap_or(0);
+                    format!("{} {first}..={last}", dim.name())
                 })
                 .collect();
             println!("write chunk at {}", axes.join(", "));
-            rows += placement.batch.num_rows() as u64;
+            rows += chunk.num_rows() as u64;
         }
-        println!("output grid: {:?}", accumulator.extents());
         Ok(rows)
     }
+}
+
+fn describe(dims: &Dimensions) -> String {
+    let axes: Vec<String> = dims
+        .iter()
+        .map(|d| format!("{}={}", d.name(), d.size()))
+        .collect();
+    axes.join(", ")
 }
 
 #[tokio::main]
@@ -216,6 +231,7 @@ async fn main() -> Result<()> {
         schema: boundary.schema(),
     });
     let write = Arc::new(NdDataSinkExec::try_new(boundary.input().clone(), sink)?);
+    println!("write plan:\n{}", displayable(write.as_ref()).indent(true));
     collect(write, ctx.task_ctx()).await?;
     Ok(())
 }
