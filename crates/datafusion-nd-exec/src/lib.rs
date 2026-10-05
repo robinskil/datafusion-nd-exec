@@ -5,6 +5,7 @@
 //! `RecordBatch`es only where a flat operator needs them.
 
 pub mod boundary;
+pub mod coordinates;
 pub mod exec;
 pub mod optimizer;
 pub mod pushdown;
@@ -19,6 +20,7 @@ pub mod testing;
 pub use nd_arrow_array as array;
 
 pub use boundary::NdBoundaryRule;
+pub use coordinates::{NdGridCoordinatesRule, add_grid_coordinates};
 pub use optimizer::is_pushable_expr;
 pub use pushdown::{AxisCoordinate, AxisRanges, axis_ranges};
 pub use registry::{NdNodeRegistry, NdProbe, NdSinker, Sunk, probe_for};

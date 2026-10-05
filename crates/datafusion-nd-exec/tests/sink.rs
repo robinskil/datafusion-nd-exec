@@ -22,7 +22,9 @@ use datafusion_nd_exec::sink::{NdDataSink, NdDataSinkExec, NdSinkFactory};
 use datafusion_nd_exec::testing::{
     Differential, MemoryGridSink, NdMemTable, grid_table, profile_table, sorted_rows,
 };
-use datafusion_nd_exec::{NdBoundaryRule, NdNodeRegistry};
+use datafusion_nd_exec::{
+    NdBoundaryRule, NdGridCoordinatesRule, NdNodeRegistry, NdSessionStateBuilderExt,
+};
 
 /// The count of the one row that a sink yields.
 async fn run(plan: Arc<dyn ExecutionPlan>) -> Result<u64> {
@@ -358,5 +360,66 @@ async fn a_cut_axis_without_its_coordinate_keeps_its_index() -> Result<()> {
     let cell = 2 * 2 + 1;
     assert!(sst.is_valid(cell) && sst.value(cell) == 5.5, "{sst:?}");
     assert!(sst.is_null(cell - 1));
+    Ok(())
+}
+
+/// The host maps the CSV sink of `COPY TO` to an in-memory grid sink.
+#[derive(Debug)]
+struct CsvAsGrid {
+    sink: Arc<MemoryGridSink>,
+}
+
+impl NdSinkFactory for CsvAsGrid {
+    fn nd_sink(&self, sink: &dyn DataSink) -> Option<Arc<dyn NdDataSink>> {
+        use datafusion::datasource::file_format::csv::CsvSink;
+        sink.as_any()
+            .is::<CsvSink>()
+            .then(|| self.sink.clone() as Arc<dyn NdDataSink>)
+    }
+}
+
+#[tokio::test]
+async fn a_grid_copy_gets_its_coordinates() -> Result<()> {
+    use arrow::datatypes::Float64Type;
+    use datafusion::catalog::TableProvider;
+    use datafusion::execution::SessionStateBuilder;
+    use datafusion::prelude::SessionContext;
+
+    let table = undeclared_grid_table()?;
+    // The sink gets the schema with the coordinates that the rule adds.
+    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+        table.schema().field_with_name("sst")?.clone(),
+        table.schema().field_with_name("time")?.clone(),
+        table.schema().field_with_name("lat")?.clone(),
+        table.schema().field_with_name("lon")?.clone(),
+    ]));
+    let grid_sink = Arc::new(MemoryGridSink::new(schema));
+    let registry = Arc::new(NdNodeRegistry::new().with_sink_factory(Arc::new(CsvAsGrid {
+        sink: grid_sink.clone(),
+    })));
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_nd_pipeline(registry)
+        .with_analyzer_rule(Arc::new(NdGridCoordinatesRule::all()))
+        .build();
+    let ctx = SessionContext::new_with_state(state);
+    ctx.register_table("t", Arc::new(table))?;
+
+    let out = std::env::temp_dir().join("nd-grid-copy.csv");
+    let sql = format!(
+        "COPY (SELECT sst FROM t WHERE lat > 0) TO '{}' STORED AS CSV",
+        out.display().to_string().replace('\\', "/")
+    );
+    let rows = ctx.sql(&sql).await?.collect().await?;
+    let count = rows[0]
+        .column(0)
+        .as_primitive::<arrow::datatypes::UInt64Type>();
+    assert_eq!(count.value(0), 8);
+
+    let grid = grid_sink.grid().expect("one grid");
+    let shape: Vec<(&str, usize)> = grid.target().iter().map(|d| (d.name(), d.size())).collect();
+    assert_eq!(shape, [("time", 4), ("lat", 1), ("lon", 2)]);
+    let lat = grid.column(2).values().as_primitive::<Float64Type>();
+    assert_eq!(lat.values(), &[30.0]);
     Ok(())
 }
