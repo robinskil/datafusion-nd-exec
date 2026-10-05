@@ -255,6 +255,48 @@ The `NdNodeRegistry` connects crates that do not know each other:
 | `with_sinker(Arc::new(MySinker))` | Tell the boundary rule how a flat node becomes an nd node (`Sunk::Below`) or a terminal (`Sunk::Terminal`). |
 | `with_sink_factory(Arc::new(MyFactory))` | Map a flat `DataSink` of your host to an `NdDataSink`. |
 
+A sinker gets the registry as an argument, and it builds its nd node with that
+registry. The `Sunk::below(nd)` helper gives an nd node with no flat node above
+it.
+
+### Build nodes yourself
+
+The boundary rule builds the nd nodes for SQL queries. A host that plans a node
+itself calls `try_new`. Each nd node has one constructor. Its last argument is
+the registry, which resolves the nd child:
+
+| Node | Constructor |
+|---|---|
+| `NdSourceExec` | `try_new(input)` |
+| `NdBroadcastExec` | `try_new(input, registry)` |
+| `NdFilterExec` | `try_new(input, predicates, registry)` |
+| `NdProjectionExec` | `try_new(input, exprs, output_schema, registry)` |
+| `NdLimitExec` | `try_new(input, skip, fetch, registry)` |
+| `NdUnionExec` | `try_new(inputs, registry)` |
+| `NdRepartitionExec` | `try_new(input, partitions, registry)` |
+| `NdCoalescePartitionsExec` | `try_new(input, registry)` |
+| `NdCoarsenExec` | `try_new(input, factors, reduce, registry)` |
+| `NdRegridExec` | `try_new(input, registry)` |
+| `NdDataSinkExec` | `try_new(input, sink, registry)` |
+| `NdEncodeExec` | `try_new(input, registry)` |
+
+- `NdSourceExec` decodes the encoded scan, so it has no nd child and no registry.
+- `NdProjectionExec` takes `(expr, alias)` pairs. With `output_schema: Some(schema)`, the node takes `schema` as it is, for example the schema of the `ProjectionExec` that it replaces. With `None`, the schema comes from the expressions.
+- `NdDataSinkExec` adds an `NdRegridExec` above `input` when its sink requires a grid. Do not add one yourself.
+- Each constructor fails with a plan error when `input` is not an nd node of the registry.
+
+Which registry to pass:
+
+- **In a session:** `NdNodeRegistry::from_session_config(state.config())`. It gives the registry of `with_nd_pipeline`, so the probes of other crates work. Without one, it gives the default registry.
+- **With the built-in nodes only,** for example in a test: `NdNodeRegistry::shared_default()`.
+
+```rust
+let registry = NdNodeRegistry::from_session_config(state.config());
+let source: Arc<dyn ExecutionPlan> = Arc::new(NdSourceExec::try_new(file_scan)?);
+let filter = Arc::new(NdFilterExec::try_new(source, vec![predicate], registry.clone())?);
+let write = NdDataSinkExec::try_new(filter, sink, registry)?;
+```
+
 ## Read many files with different grids
 
 Every chunk carries its own grid, so the files of one table can differ:
