@@ -35,6 +35,11 @@ const GRID_QUERIES: &[&str] = &[
     "SELECT time, sst FROM grid WHERE lat > 0 ORDER BY time DESC",
     "SELECT lat * 2 AS lat2, time FROM grid ORDER BY time",
     "SELECT lat, sst FROM grid WHERE lat > 0 UNION ALL SELECT lat, sst FROM grid WHERE sst < 3",
+    "SELECT * FROM grid WHERE lat > 100",
+    "SELECT * FROM grid WHERE lat > -100",
+    "SELECT lat + lon AS s, sst FROM grid",
+    "SELECT lat * 2 AS lat2, lon + 1 AS lon1, sst, 7 AS seven FROM grid",
+    "SELECT lat * 2 AS lat2, sst FROM grid WHERE time > 101 AND sst > 2",
 ];
 
 const PROFILE_QUERIES: &[&str] = &[
