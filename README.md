@@ -209,13 +209,17 @@ A format reads chunks, encodes them, and plans the scan with the nd shape. The
 complete, runnable version is
 [crates/datafusion-nd-exec/examples/profiles.rs](crates/datafusion-nd-exec/examples/profiles.rs).
 
-1. **Build one nd batch per chunk.** Give each axis its metadata: a
-   coordinate column and its order for a grid axis, no coordinate for a
-   profile axis. `AxisOrder::detect` finds the order of a coordinate array.
+1. **Build one nd batch per chunk,** with named axes. The axes need no
+   metadata: a column with the name of its axis, on that axis alone, is the
+   coordinate of the axis, as in netCDF, CF, xarray and Zarr. Set `AxisMeta`
+   only to override that rule, or for a sort order (step 3).
+   `AxisOrder::detect` finds the order of a coordinate array.
 
    ```rust
+   // The column `t` holds the values of axis `time`, and they rise.
    let time = Dimension::new("time", 2)
-       .with_meta(Some(AxisMeta::coordinate("time", AxisOrder::Ascending)));
+       .with_meta(Some(AxisMeta::coordinate("t", AxisOrder::Ascending)));
+   // A column `N_PROF` is not the coordinate of axis `N_PROF`.
    let n_prof = Dimension::new("N_PROF", 3).with_meta(Some(AxisMeta::no_coordinate()));
    ```
 
@@ -382,8 +386,10 @@ sink that prints each step.
 **Groups:** chunks with the same axis names in the same order make one group.
 Each group gets one output grid.
 
-**Axis with a coordinate:** the axis metadata names a coordinate column, and
-the query selects that column.
+**Axis with a coordinate:** a column of the chunk lies on the axis alone,
+with one value per index. Without axis metadata, it is the column with the
+name of the axis. `AxisMeta::coordinate(column, …)` names another column, and
+`AxisMeta::no_coordinate()` turns the rule off.
 
 - The output values are the union of the values of all chunks, without duplicates.
 - The sort is ascending. It is descending only when every chunk with two or more values is strictly descending.
@@ -392,12 +398,13 @@ the query selects that column.
 **Axis without a coordinate:**
 
 - The outer axis appends: each chunk gets the next range. The order is the input partition, then the chunk number in that partition, so it does not change between runs. An outer axis whose coordinate column the query does not select also appends.
-- Each inner axis pads to the largest size, with each chunk at index 0.
+- Each inner axis keeps the original index of each kept cell. A filter that keeps `N_LEVELS [2, 3]` writes levels 2 and 3, not 0 and 1. The output size is the largest index plus 1, over all chunks.
 
-**Select the coordinate column of each inner axis.** An inner axis whose
-metadata names a coordinate column, but whose chunks do not hold it, causes a
-failure. A pad puts a chunk that a filter cuts on that axis at index 0, which
-is not its true place, so the error asks for the column instead.
+The original index is correct when all chunks share one grid on that axis.
+When the grids differ, only a coordinate can place the chunks, so select the
+coordinate column. An inner axis whose metadata names a coordinate column,
+but whose chunks do not hold it, causes a failure, and the error asks for the
+column.
 
 **Sparse grids:** each cell that no chunk writes is null. So chunks with
 other grids, for example two regions, fill one union grid.
@@ -416,7 +423,7 @@ other days. The query:
 COPY (SELECT time, lat, lon, sst FROM stores WHERE time >= '2020-01-01') TO 'all.zarr'
 ```
 
-1. The Zarr reader yields chunks with axis metadata: `time`, `lat` and `lon` each name their coordinate column. It can skip the stores and chunks before 2020 with `axis_ranges`.
+1. The Zarr reader yields chunks with the axes `time`, `lat` and `lon`. The arrays `time`, `lat` and `lon` have the names of their axes, so they are the coordinates, with no axis metadata. The reader can skip the stores and chunks before 2020 with `axis_ranges`.
 2. The `NdSinkFactory` of the host maps the `COPY TO` sink to a Zarr grid sink. The plan is `NdDataSinkExec` over `NdRegridExec` over the nd region.
 3. `NdRegridExec` collects all chunks and spills them when the memory is full. Only the records of the chunks stay in memory: their axis sizes and coordinate values.
 4. The regrid joins the days of all stores into one sorted `time` axis. `lat` and `lon` are equal in all stores, so the union keeps them as they are. Two stores with the same day fail with an overlap error.
@@ -439,9 +446,9 @@ write chunk at N_PROF 3..=4, N_LEVELS 0..=2
 write chunk at N_PROF 5..=8, N_LEVELS 0..=1
 ```
 
-`N_PROF` appends, and `N_LEVELS` pads to the largest chunk. The query keeps
-only the first levels, so most compacted chunks have fewer levels than their
-files. The second file has a profile with one level only, so its filter is not
+`N_PROF` appends. `N_LEVELS` keeps the level index of each kept cell, and its
+size is the largest kept level plus 1. The query keeps only the first levels,
+so most compacted chunks have fewer levels than their files. The second file has a profile with one level only, so its filter is not
 a rectangle, and its chunk keeps all 3 levels with nulls.
 
 **One file read in split chunks**, for example `lat 0..90` then `lat 90..180`:
@@ -460,7 +467,7 @@ Resample first to prevent this.
 | `combine_by_coords` (sorts by coordinate, then concatenates) | An axis with a coordinate, in any arrival order. |
 | `join="outer"` on the other dimensions | The union of the coordinate values, with null cells. |
 | `compat="no_conflicts"` | An overlap fails, with no check of the values. |
-| Another length on a dimension without an index | The axis pads, which gives the CF incomplete ragged layout. |
+| Another length on a dimension without an index | The inner axis grows to the largest length, which gives the CF incomplete ragged layout. |
 
 `testing::MemoryGridSink` is a complete in-memory writer on top of the
 placements. It is the reference for the tests and a model for a real writer.
@@ -489,7 +496,7 @@ cargo run -p datafusion-nd-exec --example profiles
 
 - A grid sink writes nothing until its input ends. Spilled chunks go to disk once and come back once. The input must be bounded.
 - `NdRegridExec` sends whole chunks, not blocks that match the storage chunks of the output. A Zarr sink must read, change and write a storage chunk again when a chunk covers only part of it.
-- A grid sink needs the coordinate column of each inner axis in the query. The plan does not add a missing coordinate column by itself.
+- A grid sink needs the coordinate column of each inner axis in the query when the grids of the chunks differ on that axis. The plan does not add a coordinate column that the query lacks.
 - The spatial box of `st_within` and `st_intersects` does not narrow axes yet.
 - `NdRepartitionExec` uses unbounded channels, so memory is not limited when a consumer is slow.
 - A filter adds a round-robin repartition, which loses the order, so `WHERE ... ORDER BY time` still sorts. The flat path does the same.
