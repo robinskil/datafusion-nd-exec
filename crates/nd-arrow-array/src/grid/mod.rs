@@ -9,7 +9,7 @@ use arrow::array::{Array, ArrayRef, UInt64Array};
 use crate::dimensions::Dimensions;
 use crate::error::{Result, nd_err};
 
-pub use builder::{NdBatchRecord, NdGridBuilder};
+pub use builder::{NdBatchRecord, NdGridBuilder, axis_origins};
 
 /// One output grid: its axes and the coordinate values of each axis.
 #[derive(Debug, Clone)]

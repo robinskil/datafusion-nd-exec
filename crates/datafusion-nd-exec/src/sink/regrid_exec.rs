@@ -26,6 +26,7 @@ use futures::{StreamExt, TryStreamExt};
 use nd_arrow_array::encoding::{
     decode_nd_record_batch_row, encode_nd_record_batch, encoded_schema, nd_batch_count,
 };
+use nd_arrow_array::grid::axis_origins;
 use nd_arrow_array::{
     Dimensions, NdArrowArray, NdBatchRecord, NdGridBuilder, NdOutputGrid, NdPlacement,
     NdRecordBatch, SelectionKind,
@@ -127,11 +128,12 @@ impl Collector {
     fn push(&mut self, partition: usize, batch: NdRecordBatch) -> Result<()> {
         let number = self.next[partition];
         self.next[partition] += 1;
+        let origins = axis_origins(batch.selection(), batch.target().rank());
         let batch = batch.compact()?;
         if batch.target().num_elements() == 0 {
             return Ok(());
         }
-        let record = NdBatchRecord::of(partition, number, &batch);
+        let record = NdBatchRecord::of(partition, number, &batch).with_origins(origins)?;
         // The records stay in memory until the regrid, whatever the pool says.
         self.reservation.grow(record.memory_size());
         let id = self.builder.add(record);

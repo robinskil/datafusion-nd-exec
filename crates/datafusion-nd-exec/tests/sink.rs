@@ -16,9 +16,11 @@ use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream, collect, displayable,
 };
+use datafusion_nd_exec::array::{Dimension, Dimensions, NdArrowArray, NdRecordBatch};
+use datafusion_nd_exec::exec::NdBroadcastExec;
 use datafusion_nd_exec::sink::{NdDataSink, NdDataSinkExec, NdSinkFactory};
 use datafusion_nd_exec::testing::{
-    MemoryGridSink, NdMemTable, grid_table, profile_table, sorted_rows,
+    Differential, MemoryGridSink, NdMemTable, grid_table, profile_table, sorted_rows,
 };
 use datafusion_nd_exec::{NdBoundaryRule, NdNodeRegistry};
 
@@ -279,5 +281,82 @@ async fn without_a_factory_the_flat_sink_stays() -> Result<()> {
     let optimized = NdBoundaryRule::new(NdNodeRegistry::shared_default())
         .optimize(plan, &ConfigOptions::default())?;
     assert_eq!(optimized.name(), "DataSinkExec");
+    Ok(())
+}
+
+/// `grid_table` without axis metadata: the reader declares nothing.
+fn undeclared_grid_table() -> Result<NdMemTable> {
+    let strip = |dims: &Dimensions| {
+        Dimensions::try_new(
+            dims.iter()
+                .map(|d| Dimension::new(d.name(), d.size()))
+                .collect(),
+        )
+    };
+    let partitions = grid_table()?
+        .partitions()
+        .iter()
+        .map(|batches| {
+            batches
+                .iter()
+                .map(|batch| {
+                    let columns = batch
+                        .columns()
+                        .iter()
+                        .map(|c| Ok(NdArrowArray::try_new(c.values().clone(), strip(c.dims())?)?))
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(NdRecordBatch::try_new(
+                        batch.schema().clone(),
+                        columns,
+                        strip(batch.target())?,
+                    )?)
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    NdMemTable::try_new(partitions)
+}
+
+/// Write the result of `sql` on `undeclared_grid_table` to a `MemoryGridSink`.
+async fn write_undeclared(sql: &str) -> Result<NdRecordBatch> {
+    let harness = Differential::new();
+    harness.register("t", undeclared_grid_table()?)?;
+    let ctx = harness.nd_context();
+    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+    let boundary = plan
+        .as_any()
+        .downcast_ref::<NdBroadcastExec>()
+        .expect("the plan ends in the nd region");
+    let sink = Arc::new(MemoryGridSink::new(boundary.schema()));
+    let write = NdDataSinkExec::try_new(boundary.input().clone(), sink.clone())?;
+    collect(Arc::new(write), ctx.task_ctx()).await?;
+    Ok(sink.grid().expect("one grid"))
+}
+
+#[tokio::test]
+async fn coordinates_need_no_declaration() -> Result<()> {
+    use arrow::datatypes::Float64Type;
+
+    let grid = write_undeclared("SELECT time, lat, lon, sst FROM t WHERE lat > 0").await?;
+    let shape: Vec<(&str, usize)> = grid.target().iter().map(|d| (d.name(), d.size())).collect();
+    assert_eq!(shape, [("time", 4), ("lat", 1), ("lon", 2)]);
+    let lat = grid.column(1).values().as_primitive::<Float64Type>();
+    assert_eq!(lat.values(), &[30.0]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_cut_axis_without_its_coordinate_keeps_its_index() -> Result<()> {
+    use arrow::datatypes::Float64Type;
+
+    // No `lon` column: the first chunk keeps one cell, at lon index 1.
+    let grid = write_undeclared("SELECT time, lat, sst FROM t WHERE lat > 0 AND sst > 5").await?;
+    let shape: Vec<(&str, usize)> = grid.target().iter().map(|d| (d.name(), d.size())).collect();
+    assert_eq!(shape, [("time", 3), ("lat", 3), ("lon", 2)]);
+    let sst = grid.column(2).values().as_primitive::<Float64Type>();
+    // time 101, lat 30, lon index 1.
+    let cell = 2 * 2 + 1;
+    assert!(sst.is_valid(cell) && sst.value(cell) == 5.5, "{sst:?}");
+    assert!(sst.is_null(cell - 1));
     Ok(())
 }

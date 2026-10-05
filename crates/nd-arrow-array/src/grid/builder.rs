@@ -12,6 +12,7 @@ use crate::axis::{AxisMeta, AxisOrder};
 use crate::batch::NdRecordBatch;
 use crate::dimensions::{Dimension, Dimensions};
 use crate::error::{Result, nd_err};
+use crate::selection::Selection;
 
 /// What the grid builder keeps of one batch: its origin, its grid and the
 /// coordinate values of each axis.
@@ -25,6 +26,9 @@ pub struct NdBatchRecord {
     pub dims: Dimensions,
     /// One entry per axis of `dims`: the coordinate values, or `None`.
     pub coordinates: Vec<Option<ArrayRef>>,
+    /// One entry per axis of `dims`: the original index of each index, or
+    /// `None` when the indices are `0..size`.
+    pub origins: Vec<Option<UInt64Array>>,
 }
 
 impl NdBatchRecord {
@@ -43,7 +47,35 @@ impl NdBatchRecord {
             batch: number,
             dims: batch.target().clone(),
             coordinates,
+            origins: vec![None; batch.target().rank()],
         }
+    }
+
+    /// Set the original index of each index per axis, see [`axis_origins`].
+    pub fn with_origins(mut self, origins: Vec<Option<UInt64Array>>) -> Result<Self> {
+        if origins.len() != self.dims.rank() {
+            return nd_err!(
+                "{} has {} axes but {} origin entries",
+                self.label(),
+                self.dims.rank(),
+                origins.len()
+            );
+        }
+        for (dim, origin) in self.dims.iter().zip(&origins) {
+            if let Some(origin) = origin
+                && origin.len() != dim.size()
+            {
+                return nd_err!(
+                    "axis '{}' of {} has size {} but {} origins",
+                    dim.name(),
+                    self.label(),
+                    dim.size(),
+                    origin.len()
+                );
+            }
+        }
+        self.origins = origins;
+        Ok(self)
     }
 
     /// The memory of the coordinate values, in bytes.
@@ -57,6 +89,16 @@ impl NdBatchRecord {
 
     fn label(&self) -> String {
         format!("partition {} batch {}", self.partition, self.batch)
+    }
+}
+
+/// The original index of each index per axis, after
+/// [`NdRecordBatch::compact`] of a batch with `selection` on `rank` axes. Only
+/// an `AxisIndices` selection cuts the grid, so the other states give `None`.
+pub fn axis_origins(selection: &Selection, rank: usize) -> Vec<Option<UInt64Array>> {
+    match selection {
+        Selection::AxisIndices(axes) => axes.clone(),
+        _ => vec![None; rank],
     }
 }
 
@@ -290,30 +332,47 @@ impl NdGridBuilder {
             .iter()
             .map(|&m| self.records[m].dims.get(axis).size())
             .collect();
-        let mut offsets = vec![0; members.len()];
-        let size = if axis == 0 {
+        let positions: Vec<UInt64Array> = if axis == 0 {
             // The outer axis appends in the order of partition, then batch number.
             let mut order: Vec<usize> = (0..members.len()).collect();
             order.sort_by_key(|&k| {
                 let record = &self.records[members[k]];
                 (record.partition, record.batch)
             });
+            let mut offsets = vec![0; members.len()];
             let mut next = 0;
             for k in order {
                 offsets[k] = next;
                 next += sizes[k];
             }
-            next
+            offsets
+                .iter()
+                .zip(&sizes)
+                .map(|(&offset, &len)| {
+                    UInt64Array::from_iter_values((offset..offset + len).map(|i| i as u64))
+                })
+                .collect()
         } else {
-            sizes.iter().copied().max().unwrap_or(0)
+            // An inner axis keeps the original index, so a cut does not move cells.
+            members
+                .iter()
+                .zip(&sizes)
+                .map(|(&m, &len)| match &self.records[m].origins[axis] {
+                    Some(origin) => origin.clone(),
+                    None => UInt64Array::from_iter_values(0..len as u64),
+                })
+                .collect()
         };
-        let positions = offsets
-            .iter()
-            .zip(&sizes)
-            .map(|(&offset, &len)| {
-                UInt64Array::from_iter_values((offset..offset + len).map(|i| i as u64))
-            })
-            .collect();
+        let size = if axis == 0 {
+            sizes.iter().sum()
+        } else {
+            positions
+                .iter()
+                .filter_map(|p| p.values().iter().max())
+                .map(|&max| max as usize + 1)
+                .max()
+                .unwrap_or(0)
+        };
         OutputAxis {
             size,
             meta: self.records[members[0]].dims.get(axis).meta().cloned(),
@@ -377,7 +436,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Int64Type, Schema};
 
     use super::*;
-    use crate::NdArrowArray;
+    use crate::{NdArrowArray, Selection};
 
     /// One axis of a test record: coordinate values, or a plain size.
     enum Axis {
@@ -408,11 +467,13 @@ mod tests {
                 }
             }
         }
+        let origins = vec![None; dims.len()];
         NdBatchRecord {
             partition,
             batch,
             dims: Dimensions::try_new(dims).unwrap(),
             coordinates,
+            origins,
         }
     }
 
@@ -695,5 +756,48 @@ mod tests {
         let meta = placements[0].grid().dims().get(0).meta().unwrap();
         assert_eq!(meta.coordinate_column(), Some("time"));
         assert_eq!(meta.order(), AxisOrder::Ascending);
+    }
+
+    #[test]
+    fn origins_come_from_an_axis_indices_selection() {
+        let kept = vec![None, Some(UInt64Array::from(vec![2, 3]))];
+        assert_eq!(axis_origins(&Selection::AxisIndices(kept.clone()), 2), kept);
+        assert_eq!(axis_origins(&Selection::Full, 2), vec![None, None]);
+        let mask = Selection::CellMask(UInt64Array::from(vec![0]));
+        assert_eq!(axis_origins(&mask, 2), vec![None, None]);
+    }
+
+    #[test]
+    fn an_inner_axis_without_a_coordinate_keeps_the_original_index() {
+        let first = record(0, 0, vec![Axis::C("time", vec![1]), Axis::P("lev", 2)])
+            .with_origins(vec![None, Some(UInt64Array::from(vec![2, 3]))])
+            .unwrap();
+        let second = record(0, 1, vec![Axis::C("time", vec![2]), Axis::P("lev", 1)])
+            .with_origins(vec![None, Some(UInt64Array::from(vec![0]))])
+            .unwrap();
+        let placements = finish(vec![first, second]).unwrap();
+        assert_eq!(positions(&placements[0], "lev"), [2, 3]);
+        assert_eq!(positions(&placements[1], "lev"), [0]);
+        let expected = vec![("time".to_string(), 2), ("lev".to_string(), 4)];
+        assert_eq!(shape(&placements[0]), expected);
+    }
+
+    #[test]
+    fn the_outer_axis_appends_whatever_the_origins() {
+        let first = record(0, 0, vec![Axis::P("N_PROF", 2)])
+            .with_origins(vec![Some(UInt64Array::from(vec![5, 7]))])
+            .unwrap();
+        let second = record(0, 1, vec![Axis::P("N_PROF", 1)]);
+        let placements = finish(vec![first, second]).unwrap();
+        assert_eq!(positions(&placements[0], "N_PROF"), [0, 1]);
+        assert_eq!(positions(&placements[1], "N_PROF"), [2]);
+    }
+
+    #[test]
+    fn origins_must_fit_the_axes() {
+        let record = record(0, 0, vec![Axis::P("lev", 2)]);
+        assert!(record.clone().with_origins(vec![]).is_err());
+        let short = vec![Some(UInt64Array::from(vec![1]))];
+        assert!(record.with_origins(short).is_err());
     }
 }
