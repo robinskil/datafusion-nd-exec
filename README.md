@@ -123,7 +123,6 @@ ProjectionExec [lat * 2]               NdBroadcastExec: region=[NdProjectionExec
 | `NdRepartitionExec` | round-robin `RepartitionExec` | Sends whole chunks round robin to more partitions, so the broadcast runs in parallel. |
 | `NdCoalescePartitionsExec` | `CoalescePartitionsExec` | Merges all partitions into one nd stream. |
 | `NdCoarsenExec` | none, a host plans it | Reduces blocks of cells along axes, with mean, min, max or first, for example for map tiles. |
-| `NdAxisReorderExec`, `NdEmptyExec` | none | Building blocks for sinks. |
 | `NdBroadcastExec` | the boundary | Makes flat rows. |
 | `NdDataSinkExec` | `DataSinkExec` | A terminal: writes the grid with an `NdDataSink`. |
 | `NdRegridExec` | none, the sink adds it | Collects all chunks with spill, builds the output grids, and gives each chunk its place. |
