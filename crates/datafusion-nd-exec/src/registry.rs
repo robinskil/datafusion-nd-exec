@@ -17,7 +17,7 @@ use crate::exec::{
     NdAxisReorderExec, NdCoalescePartitionsExec, NdCoarsenExec, NdEmptyExec, NdExecutionPlan,
     NdFilterExec, NdLimitExec, NdProjectionExec, NdRepartitionExec, NdSourceExec, NdUnionExec,
 };
-use crate::sink::NdSinkFactory;
+use crate::sink::{NdRegridExec, NdSinkFactory};
 use crate::sinkers::{
     CoalesceSinker, DataSinkSinker, FilterSinker, LimitSinker, ProjectionSinker, RepartitionSinker,
     UnionSinker,
@@ -92,6 +92,7 @@ impl NdNodeRegistry {
             .with_probe(probe_for::<NdAxisReorderExec>())
             .with_probe(probe_for::<NdCoalescePartitionsExec>())
             .with_probe(probe_for::<NdCoarsenExec>())
+            .with_probe(probe_for::<NdRegridExec>())
             .with_sinker(Arc::new(FilterSinker))
             .with_sinker(Arc::new(ProjectionSinker))
             .with_sinker(Arc::new(UnionSinker))

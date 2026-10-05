@@ -8,7 +8,9 @@
 mod accumulator;
 mod encode;
 mod exec;
+mod regrid_exec;
 
 pub use accumulator::{AxisMode, AxisPlacement, NdGridAccumulator, Placement};
 pub use encode::{NdEncodeExec, nd_output_plan};
 pub use exec::{NdDataSink, NdDataSinkExec, NdSinkFactory};
+pub use regrid_exec::NdRegridExec;
