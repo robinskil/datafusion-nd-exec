@@ -1,6 +1,8 @@
 //! Grid-shaped record batches: columns with heterogeneous dimension subsets
 //! over a shared target grid.
 
+use std::sync::Arc;
+
 use crate::error::Result;
 use crate::error::nd_err;
 use arrow::array::{ArrayRef, BooleanArray, RecordBatchOptions, UInt64Array};
@@ -10,6 +12,7 @@ use arrow::record_batch::RecordBatch;
 
 use super::array::NdArrowArray;
 use super::dimensions::{Dimension, Dimensions};
+use super::grid::NdPlacement;
 use super::selection::Selection;
 
 /// A record batch whose columns are [`NdArrowArray`]s over a shared target
@@ -29,6 +32,7 @@ pub struct NdRecordBatch {
     columns: Vec<NdArrowArray>,
     target: Dimensions,
     selection: Selection,
+    placement: Option<Arc<NdPlacement>>,
 }
 
 impl NdRecordBatch {
@@ -62,14 +66,17 @@ impl NdRecordBatch {
             columns,
             target,
             selection: Selection::Full,
+            placement: None,
         })
     }
 
     /// Replace the selection of the batch. The selection is validated against
-    /// the target grid.
+    /// the target grid. A new selection drops the placement, because it breaks
+    /// the dense block.
     pub fn with_selection(mut self, selection: Selection) -> Result<Self> {
         selection.validate(&self.target)?;
         self.selection = selection;
+        self.placement = None;
         Ok(self)
     }
 
@@ -91,6 +98,40 @@ impl NdRecordBatch {
 
     pub fn selection(&self) -> &Selection {
         &self.selection
+    }
+
+    /// Set the place of the batch in an output grid. The batch must have a
+    /// `Full` selection and the axes of the grid in the same order, with one
+    /// position per index on each axis.
+    pub fn with_placement(mut self, placement: Arc<NdPlacement>) -> Result<Self> {
+        if self.selection != Selection::Full {
+            return nd_err!("a placed batch must have a full selection");
+        }
+        let grid = placement.grid().dims();
+        if names(grid) != names(&self.target) {
+            return nd_err!(
+                "the batch axes [{}] differ from the grid axes [{}]",
+                names(&self.target).join(", "),
+                names(grid).join(", ")
+            );
+        }
+        for (dim, positions) in self.target.iter().zip(placement.indices()) {
+            if positions.len() != dim.size() {
+                return nd_err!(
+                    "axis '{}' has size {} but the placement has {} positions",
+                    dim.name(),
+                    dim.size(),
+                    positions.len()
+                );
+            }
+        }
+        self.placement = Some(placement);
+        Ok(self)
+    }
+
+    /// The place of the batch in an output grid, or `None`.
+    pub fn placement(&self) -> Option<&Arc<NdPlacement>> {
+        self.placement.as_ref()
     }
 
     /// True when the retained cells form a rectangle of the target grid.
@@ -227,6 +268,11 @@ impl NdRecordBatch {
         let batch = RecordBatch::try_new_with_options(self.schema.clone(), arrays, &options)?;
         Ok((batch, broadcasts, passthroughs))
     }
+}
+
+/// The axis names of `dims`, outer first.
+fn names(dims: &Dimensions) -> Vec<&str> {
+    dims.iter().map(|d| d.name()).collect()
 }
 
 #[cfg(test)]

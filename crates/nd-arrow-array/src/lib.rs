@@ -14,6 +14,7 @@ pub mod dimensions;
 pub mod encoding;
 pub mod error;
 pub mod extension;
+pub mod grid;
 pub mod selection;
 
 pub use array::NdArrowArray;
@@ -23,4 +24,5 @@ pub use broadcast::BroadcastMap;
 pub use dimensions::{Dimension, Dimensions};
 pub use error::{ArrowError, Result};
 pub use extension::{NdArrayMetadata, NdArrayType};
+pub use grid::{NdOutputGrid, NdPlacement};
 pub use selection::{Selection, SelectionKind};
