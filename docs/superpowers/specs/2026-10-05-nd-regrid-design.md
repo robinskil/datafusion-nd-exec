@@ -26,7 +26,7 @@ Scope: this repo only. Beacon integration comes later.
 
 **Before collection:** each batch goes through `NdRecordBatch::compact()`, so
 it is a dense block with a `Full` selection. A cell that a filter removes is
-null.
+null. A batch with no cells is dropped.
 
 **Groups:** batches with the same axis names in the same order make one group.
 Each group gets one output grid. The same axes in another order make another
@@ -36,7 +36,8 @@ group.
 that column is in the batch.
 
 - The output values are the union of the values of all batches, without duplicates.
-- The sort is ascending. It is descending only when every batch is strictly descending.
+- The sort is ascending. It is descending only when every batch with two or more values is strictly descending, and at least one such batch exists.
+- An axis that has a coordinate in some batches of a group but not in others causes a failure.
 - The sort and the duplicate check use the Arrow row format, so they work for each data type.
 - A null coordinate value causes a failure.
 - When the query does not select the coordinate column, the axis counts as an axis without a coordinate.
@@ -106,8 +107,9 @@ NdDataSinkExec: sink=ZarrSink
 
 - Read all input partitions at the same time. Call `compact()` on each batch.
 - Give the record of each batch to the `NdGridBuilder`. The records stay in memory and count against the reservation.
-- Encode each batch with `encode_nd_record_batch` and hold it in a `MemoryReservation`.
-- When the reservation cannot grow, spill all held batches to one IPC file through DataFusion's `SpillManager`, then free the memory.
+- Hold each batch in a `MemoryReservation`.
+- When the reservation cannot grow, encode all held batches with `encode_nd_record_batch` and spill them to one IPC file through DataFusion's `SpillManager`. Then free the memory.
+- The spill schema is the encoded schema of the input, without per-batch axis metadata. The record of each batch keeps its grid, so the restream restores the axis metadata.
 
 **Regrid:**
 
