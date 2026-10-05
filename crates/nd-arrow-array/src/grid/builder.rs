@@ -102,7 +102,8 @@ impl NdGridBuilder {
     }
 
     /// The placement of each batch, by batch number. Fails on an overlap, a
-    /// null coordinate or a repeated coordinate value.
+    /// null coordinate, a repeated coordinate value, or an inner axis whose
+    /// coordinate column the batches do not hold.
     pub fn finish(self) -> Result<Vec<Arc<NdPlacement>>> {
         let mut placements: Vec<Option<Arc<NdPlacement>>> = vec![None; self.records.len()];
         for members in self.groups() {
@@ -151,6 +152,19 @@ impl NdGridBuilder {
             let output = if with_values == members.len() {
                 self.coordinate_axis(members, axis)?
             } else if with_values == 0 {
+                // A pad puts a cut chunk at index 0, so an inner axis needs its coordinate.
+                let column = members.iter().find_map(|&m| {
+                    let meta = self.records[m].dims.get(axis).meta()?;
+                    meta.coordinate_column()
+                });
+                if let Some(column) = column
+                    && axis > 0
+                {
+                    return nd_err!(
+                        "inner axis '{}' has the coordinate column '{column}', but the batches do not hold it: select the column '{column}' to write a grid",
+                        dim.name()
+                    );
+                }
                 self.plain_axis(members, axis)
             } else {
                 return nd_err!(
@@ -363,6 +377,8 @@ mod tests {
     enum Axis {
         C(&'static str, Vec<i64>),
         P(&'static str, usize),
+        /// An axis with a coordinate column that the query does not select.
+        U(&'static str, usize),
     }
 
     fn record(partition: usize, batch: usize, axes: Vec<Axis>) -> NdBatchRecord {
@@ -377,6 +393,11 @@ mod tests {
                 }
                 Axis::P(name, size) => {
                     dims.push(Dimension::new(name, size));
+                    coordinates.push(None);
+                }
+                Axis::U(name, size) => {
+                    let meta = AxisMeta::coordinate(name, AxisOrder::Ascending);
+                    dims.push(Dimension::new(name, size).with_meta(Some(meta)));
                     coordinates.push(None);
                 }
             }
@@ -586,5 +607,26 @@ mod tests {
         let placements =
             finish(vec![record.clone(), NdBatchRecord { batch: 2, ..record }]).unwrap();
         assert_eq!(positions(&placements[1], "time"), [2, 3]);
+    }
+
+    #[test]
+    fn an_inner_axis_without_its_coordinate_column_is_an_error() {
+        let error = finish(vec![
+            record(0, 0, vec![Axis::C("time", vec![1]), Axis::U("lon", 1)]),
+            record(0, 1, vec![Axis::C("time", vec![2]), Axis::U("lon", 2)]),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("select the column 'lon'"), "{error}");
+    }
+
+    #[test]
+    fn an_outer_axis_without_its_coordinate_column_appends() {
+        let placements = finish(vec![
+            record(0, 0, vec![Axis::U("time", 2), Axis::C("lat", vec![0])]),
+            record(1, 0, vec![Axis::U("time", 1), Axis::C("lat", vec![0])]),
+        ])
+        .unwrap();
+        assert_eq!(positions(&placements[1], "time"), [2]);
     }
 }

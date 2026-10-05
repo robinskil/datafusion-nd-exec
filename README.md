@@ -389,15 +389,15 @@ the query selects that column.
 - The sort is ascending. It is descending only when every chunk with two or more values is strictly descending.
 - A null value, a value that repeats in one chunk, or a coordinate in some chunks only causes a failure.
 
-**Axis without a coordinate**, or with a coordinate column that the query does
-not select:
+**Axis without a coordinate:**
 
-- The outer axis appends: each chunk gets the next range. The order is the input partition, then the chunk number in that partition, so it does not change between runs.
+- The outer axis appends: each chunk gets the next range. The order is the input partition, then the chunk number in that partition, so it does not change between runs. An outer axis whose coordinate column the query does not select also appends.
 - Each inner axis pads to the largest size, with each chunk at index 0.
 
-Select the coordinate column of each inner axis for a grid sink. Without it,
-the inner axis pads. A chunk that a filter cuts on that axis then starts at
-index 0, which is not its true place.
+**Select the coordinate column of each inner axis.** An inner axis whose
+metadata names a coordinate column, but whose chunks do not hold it, causes a
+failure. A pad puts a chunk that a filter cuts on that axis at index 0, which
+is not its true place, so the error asks for the column instead.
 
 **Sparse grids:** each cell that no chunk writes is null. So chunks with
 other grids, for example two regions, fill one union grid.
@@ -489,7 +489,7 @@ cargo run -p datafusion-nd-exec --example profiles
 
 - A grid sink writes nothing until its input ends. Spilled chunks go to disk once and come back once. The input must be bounded.
 - `NdRegridExec` sends whole chunks, not blocks that match the storage chunks of the output. A Zarr sink must read, change and write a storage chunk again when a chunk covers only part of it.
-- An inner axis whose coordinate column the query does not select pads, so a chunk that a filter cuts on that axis goes to index 0.
+- A grid sink needs the coordinate column of each inner axis in the query. The plan does not add a missing coordinate column by itself.
 - The spatial box of `st_within` and `st_intersects` does not narrow axes yet.
 - `NdRepartitionExec` uses unbounded channels, so memory is not limited when a consumer is slow.
 - A filter adds a round-robin repartition, which loses the order, so `WHERE ... ORDER BY time` still sorts. The flat path does the same.

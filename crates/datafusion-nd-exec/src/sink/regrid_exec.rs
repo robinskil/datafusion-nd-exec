@@ -469,4 +469,23 @@ mod tests {
                 .is_err()
         );
     }
+
+    #[tokio::test]
+    async fn a_scan_without_an_inner_coordinate_fails() {
+        // The projection keeps time, lat and sst, but not lon.
+        let scan = grid_table()
+            .unwrap()
+            .nd_scan(Some(&vec![0, 1, 3]), NdNodeRegistry::shared_default())
+            .unwrap();
+        let exec = NdRegridExec::try_new(scan.children()[0].clone()).unwrap();
+        let stream = exec
+            .execute_nd(0, Arc::new(TaskContext::default()))
+            .unwrap();
+        let error = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("select the column 'lon'"), "{error}");
+    }
 }

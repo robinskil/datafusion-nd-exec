@@ -40,7 +40,8 @@ that column is in the batch.
 - An axis that has a coordinate in some batches of a group but not in others causes a failure.
 - The sort and the duplicate check use the Arrow row format, so they work for each data type.
 - A null coordinate value causes a failure.
-- When the query does not select the coordinate column, the axis counts as an axis without a coordinate.
+- When the query does not select the coordinate column of the outer axis, that axis counts as an axis without a coordinate.
+- When the query does not select the coordinate column of an inner axis, the regrid fails. A pad puts a chunk that a filter cuts on that axis at index 0, which is not its true place. The error asks for the column.
 
 **Axis without a coordinate:**
 
@@ -160,7 +161,7 @@ The older phase specs stay as they are.
   - groups by axis set;
   - a gap gives null cells;
   - an overlap error and a null coordinate error;
-  - an axis whose coordinate column the query does not select appends.
+  - an outer axis whose coordinate column the query does not select appends, and an inner axis fails.
 - Placement: `with_selection` drops it.
 - Spill: a small `FairSpillPool` forces spills. The output is the same as without spills, and the spill metrics are above 0.
 - Plan: `EXPLAIN` shows `NdRegridExec` below `NdDataSinkExec` only when the sink requires a grid.
