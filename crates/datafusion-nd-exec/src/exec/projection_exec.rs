@@ -24,9 +24,7 @@ use datafusion::execution::TaskContext;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::projection::ProjectionMapping;
 use datafusion::physical_plan::ExecutionPlanProperties;
-use datafusion::physical_plan::metrics::{
-    BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
-};
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
@@ -244,12 +242,7 @@ impl NdExecutionPlan for NdProjectionExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableNdBatchStream> {
         let baseline = BaselineMetrics::new(&self.metrics, partition);
-        let projection_metrics = ProjectMetrics {
-            elements_evaluated: MetricBuilder::new(&self.metrics)
-                .counter("elements_evaluated", partition),
-            elements_saved: MetricBuilder::new(&self.metrics).counter("elements_saved", partition),
-            broadcasts: MetricBuilder::new(&self.metrics).counter("implicit_broadcasts", partition),
-        };
+        let projection_metrics = ProjectMetrics::new(&self.metrics, partition);
         let this = self.clone();
         let stream = self
             .nd_input

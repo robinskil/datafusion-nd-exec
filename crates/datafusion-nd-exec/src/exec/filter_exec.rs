@@ -286,14 +286,7 @@ impl NdExecutionPlan for NdFilterExec {
             rows_pruned: MetricBuilder::new(&self.metrics).counter("rows_pruned", partition),
             cells_evaluated: MetricBuilder::new(&self.metrics)
                 .counter("cells_evaluated", partition),
-            project: ProjectMetrics {
-                elements_evaluated: MetricBuilder::new(&self.metrics)
-                    .counter("elements_evaluated", partition),
-                elements_saved: MetricBuilder::new(&self.metrics)
-                    .counter("elements_saved", partition),
-                broadcasts: MetricBuilder::new(&self.metrics)
-                    .counter("implicit_broadcasts", partition),
-            },
+            project: ProjectMetrics::new(&self.metrics, partition),
         };
         let this = self.clone();
         let stream = self
@@ -364,11 +357,7 @@ mod tests {
     }
 
     fn no_metrics() -> ProjectMetrics {
-        ProjectMetrics {
-            elements_evaluated: Count::new(),
-            elements_saved: Count::new(),
-            broadcasts: Count::new(),
-        }
+        ProjectMetrics::default()
     }
 
     /// Build the per-conjunct evaluation plan and compute the retained cells.

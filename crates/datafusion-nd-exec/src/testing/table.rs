@@ -13,7 +13,7 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 use nd_arrow_array::NdRecordBatch;
-use nd_arrow_array::encoding::{encode_nd_record_batch, logical_schema};
+use nd_arrow_array::encoding::{encode_nd_record_batch, encode_nd_record_batch_as, logical_schema};
 
 use crate::exec::{NdBroadcastExec, NdSourceExec};
 use crate::registry::NdNodeRegistry;
@@ -49,13 +49,7 @@ impl NdMemTable {
             .map(|batches| {
                 batches
                     .iter()
-                    .map(|batch| {
-                        let encoded = encode_nd_record_batch(batch)?;
-                        Ok(RecordBatch::try_new(
-                            encoded_schema.clone(),
-                            encoded.columns().to_vec(),
-                        )?)
-                    })
+                    .map(|batch| Ok(encode_nd_record_batch_as(batch, &encoded_schema)?))
                     .collect::<Result<Vec<_>>>()
             })
             .collect::<Result<Vec<_>>>()?;

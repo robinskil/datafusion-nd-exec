@@ -55,6 +55,13 @@ pub enum Sunk {
     Terminal(Arc<dyn ExecutionPlan>),
 }
 
+impl Sunk {
+    /// An nd node below the boundary, with no flat node above it.
+    pub fn below(nd: Arc<dyn NdExecutionPlan>) -> Self {
+        Self::Below { nd, residual: None }
+    }
+}
+
 /// The sink check of one flat node kind: can the node move below the nd
 /// boundary?
 pub trait NdSinker: Send + Sync + fmt::Debug {

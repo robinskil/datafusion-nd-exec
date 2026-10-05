@@ -4,8 +4,8 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use arrow::array::{RecordBatch, RecordBatchOptions};
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::array::RecordBatch;
+use arrow::datatypes::SchemaRef;
 use datafusion::error::Result;
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
@@ -15,7 +15,7 @@ use datafusion::physical_plan::{
 };
 use futures::StreamExt;
 use nd_arrow_array::NdRecordBatch;
-use nd_arrow_array::encoding::{encode_nd_record_batch, encoded_schema};
+use nd_arrow_array::encoding::{encode_nd_record_batch_as, encoded_schema};
 
 use crate::exec::{NdBroadcastExec, NdExecutionPlan, one_child, require_nd_input};
 use crate::registry::NdNodeRegistry;
@@ -53,22 +53,9 @@ impl NdEncodeExec {
     }
 }
 
-/// One encoded row for `batch`, with the columns of `schema`. A batch with no
-/// columns becomes a row carrier with one row per cell, as a `count(*)` scan
-/// expects.
+/// One encoded row for `batch`, compacted, with the columns of `schema`.
 fn encode(batch: &NdRecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
-    if batch.columns().is_empty() {
-        return Ok(RecordBatch::try_new_with_options(
-            Arc::new(Schema::empty()),
-            vec![],
-            &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
-        )?);
-    }
-    let encoded = encode_nd_record_batch(&batch.compact()?)?;
-    Ok(RecordBatch::try_new(
-        schema.clone(),
-        encoded.columns().to_vec(),
-    )?)
+    Ok(encode_nd_record_batch_as(&batch.compact()?, schema)?)
 }
 
 impl DisplayAs for NdEncodeExec {

@@ -19,13 +19,14 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::utils::{collect_columns, reassign_expr_columns};
-use datafusion::physical_plan::metrics::Count;
+use datafusion::physical_plan::metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder};
 
 use nd_arrow_array::array::NdArrowArray;
 use nd_arrow_array::batch::NdRecordBatch;
 use nd_arrow_array::dimensions::Dimensions;
 
 /// Per-partition counters shared by the footprint-evaluating nd operators.
+#[derive(Default)]
 pub(super) struct ProjectMetrics {
     /// Total elements the expressions were evaluated over (∑ footprint sizes).
     pub elements_evaluated: Count,
@@ -36,6 +37,16 @@ pub(super) struct ProjectMetrics {
 }
 
 impl ProjectMetrics {
+    /// The counters of partition `partition` in `metrics`.
+    pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+        let counter = |name| MetricBuilder::new(metrics).counter(name, partition);
+        Self {
+            elements_evaluated: counter("elements_evaluated"),
+            elements_saved: counter("elements_saved"),
+            broadcasts: counter("implicit_broadcasts"),
+        }
+    }
+
     /// Record one evaluated expression: `evaluated` elements over its footprint
     /// (out of `target` on the full grid), and `broadcasts` implicit co-broadcasts.
     pub fn record(&self, evaluated: usize, target: usize, broadcasts: usize) {
@@ -180,7 +191,6 @@ mod tests {
     };
     use datafusion::physical_expr::ScalarFunctionExpr;
     use datafusion::physical_expr::expressions::{binary, col, lit};
-    use datafusion::physical_plan::metrics::Count;
 
     use nd_arrow_array::dimensions::Dimension;
 
@@ -278,11 +288,7 @@ mod tests {
     }
 
     fn metrics() -> ProjectMetrics {
-        ProjectMetrics {
-            elements_evaluated: Count::new(),
-            elements_saved: Count::new(),
-            broadcasts: Count::new(),
-        }
+        ProjectMetrics::default()
     }
 
     fn ints(array: &ArrayRef) -> Vec<i32> {

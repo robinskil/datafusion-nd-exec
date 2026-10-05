@@ -243,6 +243,19 @@ pub fn encode_nd_record_batch(batch: &NdRecordBatch) -> Result<RecordBatch> {
     RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), columns, &options)
 }
 
+/// Encode `batch` with the encoded schema `schema`, so every chunk of a scan
+/// carries one schema. A batch without columns becomes a row carrier with one
+/// row per cell, as a `count(*)` scan expects.
+pub fn encode_nd_record_batch_as(batch: &NdRecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
+    if batch.columns().is_empty() {
+        let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+        return RecordBatch::try_new_with_options(Arc::new(Schema::empty()), vec![], &options);
+    }
+    let encoded = encode_nd_record_batch(batch)?;
+    let options = RecordBatchOptions::new().with_row_count(Some(1));
+    RecordBatch::try_new_with_options(schema.clone(), encoded.columns().to_vec(), &options)
+}
+
 /// The logical (decoded) schema of an nd-encoded schema: each `nd.array`
 /// struct column becomes its element type.
 ///

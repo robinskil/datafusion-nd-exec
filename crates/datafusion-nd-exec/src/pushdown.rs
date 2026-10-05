@@ -16,7 +16,7 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_expr::utils::{collect_columns, reassign_expr_columns};
 use datafusion::physical_expr::{PhysicalExpr, split_conjunction};
 
-use crate::optimizer::is_pushable_expr;
+use crate::pushable::is_pushable_expr;
 
 /// The 1-D coordinate values of one axis.
 #[derive(Debug, Clone)]

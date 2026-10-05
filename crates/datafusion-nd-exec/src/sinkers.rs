@@ -18,7 +18,7 @@ use crate::exec::{
     NdCoalescePartitionsExec, NdExecutionPlan, NdFilterExec, NdLimitExec, NdProjectionExec,
     NdRepartitionExec, NdUnionExec,
 };
-use crate::optimizer::is_pushable_expr;
+use crate::pushable::is_pushable_expr;
 use crate::registry::{NdNodeRegistry, NdSinker, Sunk};
 use crate::sink::NdDataSinkExec;
 
@@ -88,13 +88,8 @@ impl NdSinker for FilterSinker {
                     )?)
                 }
             };
-            let nd: Arc<dyn NdExecutionPlan> = match filter.fetch() {
-                None => nd,
-                Some(fetch) => {
-                    Arc::new(NdLimitExec::try_new(nd, 0, Some(fetch), registry.clone())?)
-                }
-            };
-            return Ok(Some(Sunk::Below { nd, residual: None }));
+            let nd = with_fetch(nd, filter.fetch(), registry)?;
+            return Ok(Some(Sunk::below(nd)));
         }
 
         // The residual keeps the old input as a placeholder: the boundary rule
@@ -154,10 +149,7 @@ impl NdSinker for ProjectionSinker {
             Some(projection.schema()),
             registry.clone(),
         )?;
-        Ok(Some(Sunk::Below {
-            nd: Arc::new(nd),
-            residual: None,
-        }))
+        Ok(Some(Sunk::below(Arc::new(nd))))
     }
 }
 
@@ -192,10 +184,7 @@ impl NdSinker for UnionSinker {
             return Ok(None);
         }
         let nd = NdUnionExec::try_new(children.to_vec(), registry.clone())?;
-        Ok(Some(Sunk::Below {
-            nd: Arc::new(nd),
-            residual: None,
-        }))
+        Ok(Some(Sunk::below(Arc::new(nd))))
     }
 }
 
@@ -233,10 +222,7 @@ impl NdSinker for LimitSinker {
             return Ok(None);
         };
         let nd = NdLimitExec::try_new(child.clone(), skip, fetch, registry.clone())?;
-        Ok(Some(Sunk::Below {
-            nd: Arc::new(nd),
-            residual: None,
-        }))
+        Ok(Some(Sunk::below(Arc::new(nd))))
     }
 }
 
@@ -272,10 +258,7 @@ impl NdSinker for RepartitionSinker {
             return Ok(None);
         }
         let nd = NdRepartitionExec::try_new(child.clone(), *partitions, registry.clone())?;
-        Ok(Some(Sunk::Below {
-            nd: Arc::new(nd),
-            residual: None,
-        }))
+        Ok(Some(Sunk::below(Arc::new(nd))))
     }
 }
 
@@ -307,16 +290,11 @@ impl NdSinker for CoalesceSinker {
             child.clone(),
             registry.clone(),
         )?);
-        let nd: Arc<dyn NdExecutionPlan> = match coalesce.fetch() {
-            None => merged,
-            Some(fetch) => Arc::new(NdLimitExec::try_new(
-                merged,
-                0,
-                Some(fetch),
-                registry.clone(),
-            )?),
-        };
-        Ok(Some(Sunk::Below { nd, residual: None }))
+        Ok(Some(Sunk::below(with_fetch(
+            merged,
+            coalesce.fetch(),
+            registry,
+        )?)))
     }
 }
 
@@ -354,4 +332,16 @@ impl NdSinker for DataSinkSinker {
         let terminal = NdDataSinkExec::try_new(child.clone(), sink, registry.clone())?;
         Ok(Some(Sunk::Terminal(Arc::new(terminal))))
     }
+}
+
+/// `nd`, with an [`NdLimitExec`] on top when `fetch` is set.
+fn with_fetch(
+    nd: Arc<dyn NdExecutionPlan>,
+    fetch: Option<usize>,
+    registry: &Arc<NdNodeRegistry>,
+) -> Result<Arc<dyn NdExecutionPlan>> {
+    Ok(match fetch {
+        None => nd,
+        Some(fetch) => Arc::new(NdLimitExec::try_new(nd, 0, Some(fetch), registry.clone())?),
+    })
 }

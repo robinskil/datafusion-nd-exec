@@ -5,7 +5,6 @@ use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
-use arrow::array::RecordBatchOptions;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
@@ -24,7 +23,7 @@ use datafusion::physical_plan::{
 };
 use futures::{StreamExt, TryStreamExt};
 use nd_arrow_array::encoding::{
-    decode_nd_record_batch_row, encode_nd_record_batch, encoded_schema, nd_batch_count,
+    decode_nd_record_batch_row, encode_nd_record_batch_as, encoded_schema, nd_batch_count,
 };
 use nd_arrow_array::grid::axis_origins;
 use nd_arrow_array::{
@@ -168,13 +167,7 @@ impl Collector {
 
     /// The encoded batch on the spill schema. The record keeps the axis metadata.
     fn encode(&self, batch: &NdRecordBatch) -> Result<RecordBatch> {
-        let encoded = encode_nd_record_batch(batch)?;
-        let options = RecordBatchOptions::new().with_row_count(Some(1));
-        Ok(RecordBatch::try_new_with_options(
-            self.spill_schema.clone(),
-            encoded.columns().to_vec(),
-            &options,
-        )?)
+        Ok(encode_nd_record_batch_as(batch, &self.spill_schema)?)
     }
 
     /// Build the grids, then stream the spilled batches and the held batches

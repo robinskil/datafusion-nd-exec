@@ -7,7 +7,7 @@
 pub mod boundary;
 pub mod coordinates;
 pub mod exec;
-pub mod optimizer;
+pub mod pushable;
 pub mod pushdown;
 pub mod registry;
 pub mod session;
@@ -21,7 +21,7 @@ pub use nd_arrow_array as array;
 
 pub use boundary::NdBoundaryRule;
 pub use coordinates::{NdGridCoordinatesRule, add_grid_coordinates};
-pub use optimizer::is_pushable_expr;
+pub use pushable::is_pushable_expr;
 pub use pushdown::{AxisCoordinate, AxisRanges, axis_ranges};
 pub use registry::{NdNodeRegistry, NdProbe, NdSinker, Sunk, probe_for};
 pub use session::NdSessionStateBuilderExt;
