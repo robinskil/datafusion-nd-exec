@@ -124,7 +124,7 @@ pub(crate) fn require_nd_input(
 /// `baseline`. Per batch, each column is either broadcast with a gather
 /// (counted in `broadcasts`) or passed through zero-copy because it is already
 /// at full rank (counted in `passthroughs`).
-pub fn materialize_nd_stream(
+pub(super) fn materialize_nd_stream(
     schema: arrow::datatypes::SchemaRef,
     stream: SendableNdBatchStream,
     baseline: BaselineMetrics,
@@ -156,21 +156,6 @@ pub fn materialize_nd_stream(
         })
         .filter_map(|item| async move { item });
     Box::pin(RecordBatchStreamAdapter::new(schema, batches))
-}
-
-/// Wrap a scan in the nd spine: `NdBroadcastExec` over `NdSourceExec` over the
-/// scan.
-///
-/// The scan carries its columns `nd.array`-encoded, so `NdSourceExec` decodes
-/// them and `NdBroadcastExec` broadcasts them onto the logical schema above.
-/// Every nd format plans its scan through this function.
-pub fn nd_scan_plan(
-    conf: datafusion::datasource::physical_plan::FileScanConfig,
-) -> Result<Arc<dyn ExecutionPlan>> {
-    let scan: Arc<dyn ExecutionPlan> =
-        datafusion::datasource::source::DataSourceExec::from_data_source(conf);
-    let nd_source = Arc::new(NdSourceExec::try_new(scan)?);
-    Ok(Arc::new(NdBroadcastExec::try_new(nd_source)?))
 }
 
 #[cfg(test)]

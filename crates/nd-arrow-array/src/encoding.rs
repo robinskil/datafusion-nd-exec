@@ -34,10 +34,7 @@ use arrow_schema::extension::ExtensionType;
 use super::array::NdArrowArray;
 use super::batch::NdRecordBatch;
 use super::dimensions::{Dimension, Dimensions};
-use super::extension::{NdArrayMetadata, NdArrayType};
-
-/// Arrow extension type name tagged on an nd column's field.
-pub const ND_EXTENSION_NAME: &str = NdArrayType::NAME;
+use super::extension::{NdArrayMetadata, NdArrayType, storage_value_type};
 
 fn err(e: impl std::fmt::Display) -> ArrowError {
     ArrowError::InvalidArgumentError(e.to_string())
@@ -69,21 +66,13 @@ pub fn nd_encoded_type(value_type: &DataType) -> DataType {
     DataType::Struct(nd_struct_fields(value_type))
 }
 
-/// An nd column field named `name` carrying values of `value_type`, tagged with
-/// the [`NdArrayType`] extension type.
-pub fn nd_encoded_field(name: &str, value_type: &DataType) -> Field {
-    nd_encoded_field_of(&Field::new(name, value_type.clone(), true))
-}
-
 /// `field`, with its values carried as an [`NdArrayType`] struct.
 ///
 /// The field's own metadata travels with it, and the extension keys go on top.
 /// A scan's target schema is the *encoded* one, and the GeoArrow keys of a
 /// geometry column live in that metadata.
 pub fn nd_encoded_field_of(field: &Field) -> Field {
-    Field::new(field.name(), nd_encoded_type(field.data_type()), true)
-        .with_metadata(field.metadata().clone())
-        .with_extension_type(NdArrayType::new(field.data_type().clone()))
+    encoded_field(field, NdArrayType::new(field.data_type().clone()))
 }
 
 /// Like [`nd_encoded_field_of`], but the extension metadata also records the
@@ -91,11 +80,17 @@ pub fn nd_encoded_field_of(field: &Field) -> Field {
 /// that has it. A format that knows the axes of each column at plan time uses
 /// this, so the plan can derive the grid and its sort order.
 pub fn nd_encoded_field_with_dims(field: &Field, dims: &Dimensions) -> Field {
-    let ext =
-        NdArrayType::with_metadata(field.data_type().clone(), NdArrayMetadata::from_dims(dims));
+    let metadata = NdArrayMetadata::from_dims(dims);
+    encoded_field(
+        field,
+        NdArrayType::with_metadata(field.data_type().clone(), metadata),
+    )
+}
+
+fn encoded_field(field: &Field, extension: NdArrayType) -> Field {
     Field::new(field.name(), nd_encoded_type(field.data_type()), true)
         .with_metadata(field.metadata().clone())
-        .with_extension_type(ext)
+        .with_extension_type(extension)
 }
 
 /// The extension metadata of an nd-encoded field, or `None` when the field is
@@ -127,17 +122,7 @@ pub fn is_nd_encoded(field: &Field) -> bool {
 
 /// Element type carried by an nd-encoded struct type (the `values` list item).
 pub fn nd_value_type(encoded: &DataType) -> Result<DataType> {
-    let DataType::Struct(fields) = encoded else {
-        return nd_err!("not an nd-encoded type: {encoded}");
-    };
-    let values = fields
-        .iter()
-        .find(|f| f.name() == "values")
-        .ok_or_else(|| err("nd-encoded struct is missing a 'values' field"))?;
-    match values.data_type() {
-        DataType::List(item) => Ok(item.data_type().clone()),
-        other => nd_err!("nd-encoded 'values' must be a List, got {other}"),
-    }
+    storage_value_type(encoded)
 }
 
 /// Encode one [`NdArrowArray`] as a single-row `Struct` array.
@@ -258,28 +243,10 @@ pub fn encode_nd_record_batch(batch: &NdRecordBatch) -> Result<RecordBatch> {
     RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), columns, &options)
 }
 
-/// Encode an already-flat `RecordBatch` (e.g. a run-length-expanded ragged
-/// batch) as nd-encoded columns over a single synthetic `row` dimension. Every
-/// column is full-rank on that axis, so a later broadcast is the identity —
-/// decoding then materializing reproduces the input.
-pub fn encode_flat_batch_as_nd(batch: &RecordBatch) -> Result<RecordBatch> {
-    let rows = batch.num_rows();
-    let row_dim = || Dimensions::try_new(vec![Dimension::new("row", rows)]);
-
-    let columns = batch
-        .columns()
-        .iter()
-        .map(|c| NdArrowArray::try_new(c.clone(), row_dim()?))
-        .collect::<Result<Vec<_>>>()?;
-
-    let nd = NdRecordBatch::try_new(batch.schema(), columns, row_dim()?)?;
-    encode_nd_record_batch(&nd)
-}
-
 /// The logical (decoded) schema of an nd-encoded schema: each `nd.array`
 /// struct column becomes its element type.
 ///
-/// Nullability follows the encoded field. [`nd_encoded_field`] makes every
+/// Nullability follows the encoded field. [`nd_encoded_field_of`] makes every
 /// column of a file nullable, because a file a collection is not obliged to be
 /// uniform over is null-filled for the columns it lacks. A `PARTITIONED BY`
 /// column is not read from a file at all — its value is in the path, and the
@@ -362,17 +329,6 @@ pub fn schema_coordinates(schema: &Schema) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Decode row 0 of an nd-encoded `RecordBatch` back into an [`NdRecordBatch`].
-///
-/// An encoded row carries one whole nd array per column, so a batch with more
-/// than one row carries *several* nd batches; this only sees the first. Use
-/// [`nd_batch_count`] + [`decode_nd_record_batch_row`] to decode all of them —
-/// anything that concatenates encoded batches (DataFusion's `RoundRobinBatch`
-/// repartitioning coalesces small batches, for one) produces multi-row batches.
-pub fn decode_nd_record_batch(batch: &RecordBatch) -> Result<NdRecordBatch> {
-    decode_nd_record_batch_row(batch, 0)
-}
-
 /// How many nd batches an encoded `RecordBatch` carries.
 ///
 /// One per row, except for a zero-column `COUNT(*)`-style carrier, whose rows
@@ -426,17 +382,7 @@ pub fn plan_target_axes(encoded: &Schema) -> Option<Vec<String>> {
         .iter()
         .map(|field| nd_field_metadata(field)?.dims)
         .collect::<Option<Vec<_>>>()?;
-    let mut order: Vec<String> = columns
-        .iter()
-        .max_by_key(|dims| dims.len())
-        .cloned()
-        .unwrap_or_default();
-    for name in columns.iter().flatten() {
-        if !order.contains(name) {
-            order.push(name.clone());
-        }
-    }
-    Some(order)
+    Some(grid_order(&columns, |name| name))
 }
 
 /// Infer the target grid from decoded columns: the highest-rank column defines
@@ -446,18 +392,26 @@ pub fn plan_target_axes(encoded: &Schema) -> Option<Vec<String>> {
 /// A file opener that builds nd batches itself uses the same rule, so a batch
 /// it emits and a batch the decoder rebuilds agree on the grid.
 pub fn infer_target(columns: &[NdArrowArray]) -> Result<Dimensions> {
-    let mut order: Vec<Dimension> = Vec::new();
-    if let Some(widest) = columns.iter().max_by_key(|c| c.dims().rank()) {
-        order.extend(widest.dims().iter().cloned());
-    }
-    for column in columns {
-        for dim in column.dims().iter() {
-            if !order.iter().any(|d| d.name() == dim.name()) {
-                order.push(dim.clone());
-            }
+    let axes: Vec<Vec<Dimension>> = columns
+        .iter()
+        .map(|c| c.dims().iter().cloned().collect())
+        .collect();
+    Dimensions::try_new(grid_order(&axes, |dim| dim.name()))
+}
+
+/// The axes of the widest column, then each other axis in order of first use.
+fn grid_order<T: Clone>(columns: &[Vec<T>], name: impl Fn(&T) -> &str) -> Vec<T> {
+    let mut order: Vec<T> = columns
+        .iter()
+        .max_by_key(|axes| axes.len())
+        .cloned()
+        .unwrap_or_default();
+    for axis in columns.iter().flatten() {
+        if !order.iter().any(|known| name(known) == name(axis)) {
+            order.push(axis.clone());
         }
     }
-    Dimensions::try_new(order)
+    order
 }
 
 #[cfg(test)]
@@ -500,7 +454,7 @@ mod tests {
 
     #[test]
     fn encoded_field_is_tagged() {
-        let field = nd_encoded_field("sst", &DataType::Float64);
+        let field = nd_encoded_field_of(&Field::new("sst", DataType::Float64, true));
         assert!(is_nd_encoded(&field));
         assert_eq!(nd_value_type(field.data_type()).unwrap(), DataType::Float64);
     }
@@ -552,7 +506,7 @@ mod tests {
         .unwrap();
         let nd = NdRecordBatch::try_new(schema, vec![time, sst], grid.clone()).unwrap();
 
-        let decoded = decode_nd_record_batch(&encode_nd_record_batch(&nd).unwrap()).unwrap();
+        let decoded = decode_nd_record_batch_row(&encode_nd_record_batch(&nd).unwrap(), 0).unwrap();
         assert_eq!(decoded.target(), &grid);
         assert_eq!(decoded.target().get(0).order(), AxisOrder::Descending);
         assert_eq!(
@@ -583,7 +537,7 @@ mod tests {
             .unwrap();
         let encoded = encode_nd_record_batch(&nd).unwrap();
 
-        let decoded = decode_nd_record_batch(&encoded.project(&[1]).unwrap()).unwrap();
+        let decoded = decode_nd_record_batch_row(&encoded.project(&[1]).unwrap(), 0).unwrap();
         assert_eq!(decoded.target(), &dims(&[("lat", 3)]));
         assert_eq!(decoded.num_rows(), 3);
     }
@@ -608,7 +562,11 @@ mod tests {
         );
 
         // A field without its axes gives no plan grid.
-        let schema = Schema::new(vec![nd_encoded_field("lat", &DataType::Float64)]);
+        let schema = Schema::new(vec![nd_encoded_field_of(&Field::new(
+            "lat",
+            DataType::Float64,
+            true,
+        ))]);
         assert_eq!(plan_target_axes(&schema), None);
     }
 
@@ -649,7 +607,7 @@ mod tests {
         }
 
         // Decode → NdRecordBatch, target inferred from the widest (sst) column.
-        let decoded = decode_nd_record_batch(&encoded).unwrap();
+        let decoded = decode_nd_record_batch_row(&encoded, 0).unwrap();
         assert_eq!(decoded.target(), &dims(&[("time", 2), ("lat", 3)]));
 
         // Materializing the decoded batch matches the original.
@@ -686,31 +644,10 @@ mod tests {
             &RecordBatchOptions::new().with_row_count(Some(42)),
         )
         .unwrap();
-        let nd = decode_nd_record_batch(&empty).unwrap();
+        let nd = decode_nd_record_batch_row(&empty, 0).unwrap();
         let flat = nd.materialize().unwrap();
         assert_eq!(flat.num_columns(), 0);
         assert_eq!(flat.num_rows(), 42);
-    }
-
-    #[test]
-    fn flat_batch_round_trips_through_nd() {
-        // Ragged path: a flat batch wrapped on a synthetic row dim survives
-        // encode → decode → materialize unchanged.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("a", DataType::Int32, true),
-            Field::new("b", DataType::Float64, true),
-        ]));
-        let flat = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3])),
-                Arc::new(Float64Array::from(vec![1.5, 2.5, 3.5])),
-            ],
-        )
-        .unwrap();
-        let encoded = encode_flat_batch_as_nd(&flat).unwrap();
-        let decoded = decode_nd_record_batch(&encoded).unwrap();
-        assert_eq!(decoded.materialize().unwrap().columns(), flat.columns());
     }
 
     #[test]
@@ -759,7 +696,7 @@ mod tests {
         )
         .unwrap();
 
-        let decoded = decode_nd_record_batch(&encode_nd_record_batch(&nd).unwrap()).unwrap();
+        let decoded = decode_nd_record_batch_row(&encode_nd_record_batch(&nd).unwrap(), 0).unwrap();
         assert_eq!(
             decoded.target(),
             &dims(&[("time", 2), ("lat", 3), ("depth", 2)])
@@ -810,16 +747,13 @@ mod tests {
             .map(|r| decode_nd_record_batch_row(&merged, r).unwrap().num_rows())
             .collect();
         assert_eq!(rows, vec![6, 4], "both nd batches must survive the concat");
-
-        // The row-0-only helper still sees exactly the first one.
-        assert_eq!(decode_nd_record_batch(&merged).unwrap().num_rows(), 6);
     }
 
     #[test]
     fn logical_schema_unwraps_structs() {
         let encoded = Schema::new(vec![
-            nd_encoded_field("lat", &DataType::Int32),
-            nd_encoded_field("sst", &DataType::Float64),
+            nd_encoded_field_of(&Field::new("lat", DataType::Int32, true)),
+            nd_encoded_field_of(&Field::new("sst", DataType::Float64, true)),
         ]);
         let logical = logical_schema(&encoded).unwrap();
         assert_eq!(logical.field(0).data_type(), &DataType::Int32);

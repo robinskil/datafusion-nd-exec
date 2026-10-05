@@ -168,7 +168,7 @@ impl ExtensionType for NdArrayType {
 }
 
 /// Check the storage layout and return the element type of `values`.
-fn storage_value_type(data_type: &DataType) -> Result<DataType> {
+pub(crate) fn storage_value_type(data_type: &DataType) -> Result<DataType> {
     let DataType::Struct(fields) = data_type else {
         return Err(invalid(format!(
             "nd storage must be a Struct, got {data_type}"
