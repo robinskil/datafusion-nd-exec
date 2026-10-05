@@ -101,7 +101,9 @@ async fn source_alone_materializes_full_grid() {
 
 #[tokio::test]
 async fn source_then_broadcast_materializes_full_grid() {
-    let plan = Arc::new(NdBroadcastExec::try_new(test_source()).unwrap());
+    let plan = Arc::new(
+        NdBroadcastExec::try_new(test_source(), NdNodeRegistry::shared_default()).unwrap(),
+    );
     let batch = run(plan).await.unwrap();
 
     // 4 time x 3 lat x 2 lon = 24 rows, C-order (time outer, lon inner).
@@ -135,7 +137,9 @@ async fn source_then_broadcast_materializes_full_grid() {
 #[tokio::test]
 async fn nodes_report_metrics() {
     let source = test_source();
-    let broadcast = Arc::new(NdBroadcastExec::try_new(source.clone()).unwrap());
+    let broadcast = Arc::new(
+        NdBroadcastExec::try_new(source.clone(), NdNodeRegistry::shared_default()).unwrap(),
+    );
 
     // Drain the plan so the streams run to completion and finalize metrics.
     let out = run(broadcast.clone() as Arc<dyn ExecutionPlan>)
@@ -177,9 +181,11 @@ async fn nodes_report_metrics() {
 #[tokio::test]
 async fn broadcast_requires_nd_input() {
     // A non-nd child is rejected at construction.
-    let broadcast = Arc::new(NdBroadcastExec::try_new(test_source()).unwrap());
+    let broadcast = Arc::new(
+        NdBroadcastExec::try_new(test_source(), NdNodeRegistry::shared_default()).unwrap(),
+    );
     // Wrapping a broadcast (which is not nd-aware) must fail.
-    assert!(NdBroadcastExec::try_new(broadcast).is_err());
+    assert!(NdBroadcastExec::try_new(broadcast, NdNodeRegistry::shared_default()).is_err());
 }
 
 // ── projection pushdown ──────────────────────────────────────────────
@@ -235,15 +241,21 @@ async fn projection_before_broadcast_matches_after() {
                 .iter()
                 .cloned()
                 .map(|(expr, alias)| ProjectionExpr { expr, alias }),
-            Arc::new(NdBroadcastExec::try_new(test_source()).unwrap()),
+            Arc::new(
+                NdBroadcastExec::try_new(test_source(), NdNodeRegistry::shared_default()).unwrap(),
+            ),
         )
         .unwrap(),
     );
     let expected = run(reference).await.unwrap();
 
     // Optimized: project on footprints first, then broadcast.
-    let nd_proj = Arc::new(NdProjectionExec::try_new(test_source(), exprs).unwrap());
-    let optimized = Arc::new(NdBroadcastExec::try_new(nd_proj).unwrap());
+    let nd_proj = Arc::new(
+        NdProjectionExec::try_new(test_source(), exprs, None, NdNodeRegistry::shared_default())
+            .unwrap(),
+    );
+    let optimized =
+        Arc::new(NdBroadcastExec::try_new(nd_proj, NdNodeRegistry::shared_default()).unwrap());
     let actual = run(optimized).await.unwrap();
 
     assert_eq!(actual.num_rows(), 24);
@@ -275,14 +287,20 @@ async fn projection_combines_columns_of_different_dims() {
                 .iter()
                 .cloned()
                 .map(|(expr, alias)| ProjectionExpr { expr, alias }),
-            Arc::new(NdBroadcastExec::try_new(test_source()).unwrap()),
+            Arc::new(
+                NdBroadcastExec::try_new(test_source(), NdNodeRegistry::shared_default()).unwrap(),
+            ),
         )
         .unwrap(),
     );
     let expected = run(reference).await.unwrap();
 
-    let nd_proj = Arc::new(NdProjectionExec::try_new(test_source(), exprs).unwrap());
-    let optimized = Arc::new(NdBroadcastExec::try_new(nd_proj).unwrap());
+    let nd_proj = Arc::new(
+        NdProjectionExec::try_new(test_source(), exprs, None, NdNodeRegistry::shared_default())
+            .unwrap(),
+    );
+    let optimized =
+        Arc::new(NdBroadcastExec::try_new(nd_proj, NdNodeRegistry::shared_default()).unwrap());
     let actual = run(optimized).await.unwrap();
 
     assert_eq!(actual.num_rows(), 24);
@@ -320,14 +338,21 @@ async fn single_column_projection_skips_broadcast() {
                 .iter()
                 .cloned()
                 .map(|(expr, alias)| ProjectionExpr { expr, alias }),
-            Arc::new(NdBroadcastExec::try_new(test_source()).unwrap()),
+            Arc::new(
+                NdBroadcastExec::try_new(test_source(), NdNodeRegistry::shared_default()).unwrap(),
+            ),
         )
         .unwrap(),
     );
     let expected = run(reference).await.unwrap();
 
-    let projection = Arc::new(NdProjectionExec::try_new(test_source(), exprs).unwrap());
-    let broadcast = Arc::new(NdBroadcastExec::try_new(projection.clone()).unwrap());
+    let projection = Arc::new(
+        NdProjectionExec::try_new(test_source(), exprs, None, NdNodeRegistry::shared_default())
+            .unwrap(),
+    );
+    let broadcast = Arc::new(
+        NdBroadcastExec::try_new(projection.clone(), NdNodeRegistry::shared_default()).unwrap(),
+    );
     let actual = run(broadcast).await.unwrap();
 
     assert_eq!(actual, expected);
@@ -360,8 +385,13 @@ async fn projection_reports_metrics() {
         "lat_plus_lon".to_string(),
     )];
 
-    let projection = Arc::new(NdProjectionExec::try_new(test_source(), exprs).unwrap());
-    let broadcast = Arc::new(NdBroadcastExec::try_new(projection.clone()).unwrap());
+    let projection = Arc::new(
+        NdProjectionExec::try_new(test_source(), exprs, None, NdNodeRegistry::shared_default())
+            .unwrap(),
+    );
+    let broadcast = Arc::new(
+        NdBroadcastExec::try_new(projection.clone(), NdNodeRegistry::shared_default()).unwrap(),
+    );
     let out = run(broadcast).await.unwrap();
     assert_eq!(out.num_rows(), 24);
 
@@ -392,7 +422,9 @@ async fn pushdown_rule_sinks_projection_below_broadcast() {
                 .iter()
                 .cloned()
                 .map(|(expr, alias)| ProjectionExpr { expr, alias }),
-            Arc::new(NdBroadcastExec::try_new(test_source()).unwrap()),
+            Arc::new(
+                NdBroadcastExec::try_new(test_source(), NdNodeRegistry::shared_default()).unwrap(),
+            ),
         )
         .unwrap(),
     );
@@ -476,7 +508,9 @@ async fn pushdown_rule_skips_non_elementwise() {
                 expr: volatile,
                 alias: "r".to_string(),
             }],
-            Arc::new(NdBroadcastExec::try_new(test_source()).unwrap()),
+            Arc::new(
+                NdBroadcastExec::try_new(test_source(), NdNodeRegistry::shared_default()).unwrap(),
+            ),
         )
         .unwrap(),
     );
@@ -609,16 +643,27 @@ async fn filter_before_broadcast_matches_after() {
         let reference = Arc::new(
             FilterExec::try_new(
                 predicate.clone(),
-                Arc::new(NdBroadcastExec::try_new(test_source()).unwrap()),
+                Arc::new(
+                    NdBroadcastExec::try_new(test_source(), NdNodeRegistry::shared_default())
+                        .unwrap(),
+                ),
             )
             .unwrap(),
         );
         let expected = run(reference).await.unwrap();
 
         // Optimized: filter on footprints first (as a selection), then broadcast.
-        let nd_filter =
-            Arc::new(NdFilterExec::try_new(test_source(), vec![predicate.clone()]).unwrap());
-        let optimized = Arc::new(NdBroadcastExec::try_new(nd_filter).unwrap());
+        let nd_filter = Arc::new(
+            NdFilterExec::try_new(
+                test_source(),
+                vec![predicate.clone()],
+                NdNodeRegistry::shared_default(),
+            )
+            .unwrap(),
+        );
+        let optimized = Arc::new(
+            NdBroadcastExec::try_new(nd_filter, NdNodeRegistry::shared_default()).unwrap(),
+        );
         let actual = run(optimized).await.unwrap();
 
         assert_eq!(actual, expected, "mismatch for predicate {predicate}");
@@ -664,15 +709,25 @@ async fn multiple_conjuncts_across_axes_match_reference() {
     let reference = Arc::new(
         FilterExec::try_new(
             combined,
-            Arc::new(NdBroadcastExec::try_new(test_source()).unwrap()),
+            Arc::new(
+                NdBroadcastExec::try_new(test_source(), NdNodeRegistry::shared_default()).unwrap(),
+            ),
         )
         .unwrap(),
     );
     let expected = run(reference).await.unwrap();
 
     // Optimized: the three conjuncts as separate selections.
-    let nd_filter = Arc::new(NdFilterExec::try_new(test_source(), vec![c1, c2, c3]).unwrap());
-    let optimized = Arc::new(NdBroadcastExec::try_new(nd_filter).unwrap());
+    let nd_filter = Arc::new(
+        NdFilterExec::try_new(
+            test_source(),
+            vec![c1, c2, c3],
+            NdNodeRegistry::shared_default(),
+        )
+        .unwrap(),
+    );
+    let optimized =
+        Arc::new(NdBroadcastExec::try_new(nd_filter, NdNodeRegistry::shared_default()).unwrap());
     let actual = run(optimized).await.unwrap();
 
     assert_eq!(actual, expected);
@@ -694,14 +749,24 @@ async fn filter_selecting_no_rows_is_empty() {
     let reference = Arc::new(
         FilterExec::try_new(
             predicate.clone(),
-            Arc::new(NdBroadcastExec::try_new(test_source()).unwrap()),
+            Arc::new(
+                NdBroadcastExec::try_new(test_source(), NdNodeRegistry::shared_default()).unwrap(),
+            ),
         )
         .unwrap(),
     );
     let expected = run(reference).await.unwrap();
 
-    let nd_filter = Arc::new(NdFilterExec::try_new(test_source(), vec![predicate]).unwrap());
-    let optimized = Arc::new(NdBroadcastExec::try_new(nd_filter).unwrap());
+    let nd_filter = Arc::new(
+        NdFilterExec::try_new(
+            test_source(),
+            vec![predicate],
+            NdNodeRegistry::shared_default(),
+        )
+        .unwrap(),
+    );
+    let optimized =
+        Arc::new(NdBroadcastExec::try_new(nd_filter, NdNodeRegistry::shared_default()).unwrap());
     let actual = run(optimized).await.unwrap();
 
     assert_eq!(actual.num_rows(), 0);
@@ -722,12 +787,22 @@ async fn filter_selecting_all_rows_matches_unfiltered() {
     )
     .unwrap();
 
-    let unfiltered = run(Arc::new(NdBroadcastExec::try_new(test_source()).unwrap()))
-        .await
-        .unwrap();
+    let unfiltered = run(Arc::new(
+        NdBroadcastExec::try_new(test_source(), NdNodeRegistry::shared_default()).unwrap(),
+    ))
+    .await
+    .unwrap();
 
-    let nd_filter = Arc::new(NdFilterExec::try_new(test_source(), vec![predicate]).unwrap());
-    let optimized = Arc::new(NdBroadcastExec::try_new(nd_filter).unwrap());
+    let nd_filter = Arc::new(
+        NdFilterExec::try_new(
+            test_source(),
+            vec![predicate],
+            NdNodeRegistry::shared_default(),
+        )
+        .unwrap(),
+    );
+    let optimized =
+        Arc::new(NdBroadcastExec::try_new(nd_filter, NdNodeRegistry::shared_default()).unwrap());
     let actual = run(optimized).await.unwrap();
 
     assert_eq!(actual.num_rows(), 24);
@@ -771,7 +846,10 @@ async fn filter_then_projection_matches_reference() {
             Arc::new(
                 FilterExec::try_new(
                     predicate.clone(),
-                    Arc::new(NdBroadcastExec::try_new(test_source()).unwrap()),
+                    Arc::new(
+                        NdBroadcastExec::try_new(test_source(), NdNodeRegistry::shared_default())
+                            .unwrap(),
+                    ),
                 )
                 .unwrap(),
             ),
@@ -781,9 +859,20 @@ async fn filter_then_projection_matches_reference() {
     let expected = run(reference).await.unwrap();
 
     // Optimized: nd filter → nd projection → broadcast.
-    let nd_filter = Arc::new(NdFilterExec::try_new(test_source(), vec![predicate]).unwrap());
-    let nd_proj = Arc::new(NdProjectionExec::try_new(nd_filter, exprs).unwrap());
-    let optimized = Arc::new(NdBroadcastExec::try_new(nd_proj).unwrap());
+    let nd_filter = Arc::new(
+        NdFilterExec::try_new(
+            test_source(),
+            vec![predicate],
+            NdNodeRegistry::shared_default(),
+        )
+        .unwrap(),
+    );
+    let nd_proj = Arc::new(
+        NdProjectionExec::try_new(nd_filter, exprs, None, NdNodeRegistry::shared_default())
+            .unwrap(),
+    );
+    let optimized =
+        Arc::new(NdBroadcastExec::try_new(nd_proj, NdNodeRegistry::shared_default()).unwrap());
     let actual = run(optimized).await.unwrap();
 
     assert_eq!(actual, expected);
@@ -823,7 +912,9 @@ async fn pushdown_rule_sinks_filter_below_broadcast() {
     let original: Arc<dyn ExecutionPlan> = Arc::new(
         FilterExec::try_new(
             predicate,
-            Arc::new(NdBroadcastExec::try_new(test_source()).unwrap()),
+            Arc::new(
+                NdBroadcastExec::try_new(test_source(), NdNodeRegistry::shared_default()).unwrap(),
+            ),
         )
         .unwrap(),
     );
@@ -924,7 +1015,9 @@ async fn pushdown_rule_splits_mixed_predicate() {
     let original: Arc<dyn ExecutionPlan> = Arc::new(
         FilterExec::try_new(
             predicate,
-            Arc::new(NdBroadcastExec::try_new(test_source()).unwrap()),
+            Arc::new(
+                NdBroadcastExec::try_new(test_source(), NdNodeRegistry::shared_default()).unwrap(),
+            ),
         )
         .unwrap(),
     );

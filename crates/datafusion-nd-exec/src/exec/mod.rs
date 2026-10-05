@@ -119,6 +119,27 @@ pub(crate) fn require_nd_input(
     })
 }
 
+/// The one child of `node`, or an internal error.
+pub(crate) fn one_child(
+    node: &str,
+    children: Vec<Arc<dyn ExecutionPlan>>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let [child] = <[_; 1]>::try_from(children)
+        .map_err(|_| DataFusionError::Internal(format!("{node} expects exactly one child")))?;
+    Ok(child)
+}
+
+/// The flat output of an nd node: its nd batches, made flat by an
+/// [`NdBroadcastExec`].
+pub(crate) fn execute_flat<T: NdExecutionPlan + Clone + 'static>(
+    node: &T,
+    registry: &Arc<NdNodeRegistry>,
+    partition: usize,
+    context: Arc<TaskContext>,
+) -> Result<SendableRecordBatchStream> {
+    NdBroadcastExec::try_new(Arc::new(node.clone()), registry.clone())?.execute(partition, context)
+}
+
 /// Adapt an nd batch stream into a standard record batch stream, dropping
 /// empty batches and recording output rows / materialization time into
 /// `baseline`. Per batch, each column is either broadcast with a gather
@@ -208,14 +229,17 @@ mod tests {
         let plan: Arc<dyn ExecutionPlan> = source.clone();
         assert!(registry.as_nd_plan(&plan).is_some());
 
-        let projection: Arc<dyn ExecutionPlan> =
-            Arc::new(NdProjectionExec::try_new(plan.clone(), vec![]).unwrap());
+        let projection: Arc<dyn ExecutionPlan> = Arc::new(
+            NdProjectionExec::try_new(plan.clone(), vec![], None, NdNodeRegistry::shared_default())
+                .unwrap(),
+        );
         assert!(registry.as_nd_plan(&projection).is_some());
 
         // The broadcast is the terminal node: it flattens, so it is *not* an nd
         // producer and must not be treated as one.
-        let broadcast: Arc<dyn ExecutionPlan> =
-            Arc::new(NdBroadcastExec::try_new(plan.clone()).unwrap());
+        let broadcast: Arc<dyn ExecutionPlan> = Arc::new(
+            NdBroadcastExec::try_new(plan.clone(), NdNodeRegistry::shared_default()).unwrap(),
+        );
         assert!(registry.as_nd_plan(&broadcast).is_none());
 
         // …and neither is the underlying flat child.
@@ -229,7 +253,10 @@ mod tests {
     /// batch entirely rather than emit a zero-row `RecordBatch`.
     #[tokio::test]
     async fn empty_grids_are_dropped_instead_of_emitted() {
-        let plan = Arc::new(NdBroadcastExec::try_new(source(&[("time", 0)])).unwrap());
+        let plan = Arc::new(
+            NdBroadcastExec::try_new(source(&[("time", 0)]), NdNodeRegistry::shared_default())
+                .unwrap(),
+        );
         let batches: Vec<_> = plan
             .execute(0, Arc::new(datafusion::execution::TaskContext::default()))
             .unwrap()

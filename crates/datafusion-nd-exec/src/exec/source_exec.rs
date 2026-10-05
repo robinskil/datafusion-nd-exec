@@ -7,7 +7,7 @@ use std::sync::Arc;
 use arrow::compute::SortOptions;
 use arrow::datatypes::Schema;
 use datafusion::common::config::ConfigOptions;
-use datafusion::error::{DataFusionError, Result};
+use datafusion::error::Result;
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr, PhysicalSortExpr};
@@ -26,7 +26,8 @@ use nd_arrow_array::encoding::{
 };
 use nd_arrow_array::{AxisOrder, NdArrayMetadata, SelectionKind};
 
-use super::{NdBroadcastExec, NdExecutionPlan, SendableNdBatchStream};
+use super::{NdBroadcastExec, NdExecutionPlan, SendableNdBatchStream, one_child};
+use crate::registry::NdNodeRegistry;
 
 /// Leaf of the nd pipeline: decodes the `nd.array`-encoded `RecordBatch`es
 /// produced by a child plan (typically a `DataSourceExec` whose file opener
@@ -163,9 +164,7 @@ impl ExecutionPlan for NdSourceExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let [input] = <[_; 1]>::try_from(children).map_err(|_| {
-            DataFusionError::Internal("NdSourceExec expects exactly one child".to_string())
-        })?;
+        let input = one_child("NdSourceExec", children)?;
         Ok(Arc::new(Self::build(input, self.ordered_chunks)?))
     }
 
@@ -177,7 +176,8 @@ impl ExecutionPlan for NdSourceExec {
         // The source only produces nd batches (`execute_nd`); flattening to
         // Arrow lives in `NdBroadcastExec`. When executed as a standalone plan,
         // borrow that broadcast behaviour rather than duplicating it.
-        NdBroadcastExec::try_new(Arc::new(self.clone()))?.execute(partition, context)
+        NdBroadcastExec::try_new(Arc::new(self.clone()), NdNodeRegistry::shared_default())?
+            .execute(partition, context)
     }
 
     /// Hand the filters to the file source below, which prunes on them.
@@ -202,12 +202,6 @@ impl ExecutionPlan for NdSourceExec {
 
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
-    }
-    /// A sort must not move below this node: below it the rows are nd
-    /// batches or encoded chunks. The order still reaches the plan through the
-    /// equivalence properties.
-    fn maintains_input_order(&self) -> Vec<bool> {
-        vec![false]
     }
 }
 

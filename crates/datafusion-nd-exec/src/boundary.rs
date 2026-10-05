@@ -67,9 +67,8 @@ impl NdBoundaryRule {
             if child_selection > nd.accepts_selection() {
                 continue;
             }
-            let mut rebuilt: Arc<dyn ExecutionPlan> = Arc::new(
-                NdBroadcastExec::try_new_with_registry(nd, self.registry.clone())?,
-            );
+            let mut rebuilt: Arc<dyn ExecutionPlan> =
+                Arc::new(NdBroadcastExec::try_new(nd, self.registry.clone())?);
             if let Some(residual) = residual {
                 rebuilt = residual.with_new_children(vec![rebuilt])?;
             }

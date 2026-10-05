@@ -122,9 +122,7 @@ impl TableProvider for ProfileFiles {
         )?;
         let source = Arc::new(NdSourceExec::try_new(memory)?);
         let registry = NdNodeRegistry::from_session_config(state.config());
-        Ok(Arc::new(NdBroadcastExec::try_new_with_registry(
-            source, registry,
-        )?))
+        Ok(Arc::new(NdBroadcastExec::try_new(source, registry)?))
     }
 }
 
@@ -230,7 +228,11 @@ async fn main() -> Result<()> {
     let sink = Arc::new(PrintingGridSink {
         schema: boundary.schema(),
     });
-    let write = Arc::new(NdDataSinkExec::try_new(boundary.input().clone(), sink)?);
+    let write = Arc::new(NdDataSinkExec::try_new(
+        boundary.input().clone(),
+        sink,
+        NdNodeRegistry::shared_default(),
+    )?);
     println!("write plan:\n{}", displayable(write.as_ref()).indent(true));
     collect(write, ctx.task_ctx()).await?;
     Ok(())

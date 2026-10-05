@@ -81,7 +81,7 @@ impl ExecutionPlan for NdTagExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        NdBroadcastExec::try_new_with_registry(Arc::new(self.clone()), self.registry.clone())?
+        NdBroadcastExec::try_new(Arc::new(self.clone()), self.registry.clone())?
             .execute(partition, context)
     }
 }
@@ -135,10 +135,10 @@ async fn a_probe_from_another_crate_makes_its_node_nd_aware() {
         Arc::new(NdTagExec::try_new(source(), registry.clone()).unwrap());
 
     // The default registry does not know the node.
-    assert!(NdBroadcastExec::try_new(tag.clone()).is_err());
+    assert!(NdBroadcastExec::try_new(tag.clone(), NdNodeRegistry::shared_default()).is_err());
 
     // The registry with the probe does.
-    let broadcast = Arc::new(NdBroadcastExec::try_new_with_registry(tag, registry).unwrap());
+    let broadcast = Arc::new(NdBroadcastExec::try_new(tag, registry).unwrap());
     let schema = broadcast.schema();
     let batches: Vec<_> = broadcast
         .execute(0, Arc::new(TaskContext::default()))
@@ -244,7 +244,9 @@ async fn the_boundary_rule_sinks_a_node_of_another_crate() {
 
     let plan = || -> Arc<dyn ExecutionPlan> {
         Arc::new(FlatTagExec {
-            input: Arc::new(NdBroadcastExec::try_new(source()).unwrap()),
+            input: Arc::new(
+                NdBroadcastExec::try_new(source(), NdNodeRegistry::shared_default()).unwrap(),
+            ),
         })
     };
 

@@ -35,7 +35,7 @@ use nd_arrow_array::dimensions::Dimensions;
 use nd_arrow_array::selection::Selection;
 
 use super::expr_column::{NdExprColumn, ProjectMetrics};
-use super::{NdBroadcastExec, NdExecutionPlan, SendableNdBatchStream, require_nd_input};
+use super::{NdExecutionPlan, SendableNdBatchStream, execute_flat, one_child, require_nd_input};
 use crate::registry::NdNodeRegistry;
 
 /// Per-partition counters recorded while filtering.
@@ -71,20 +71,8 @@ pub struct NdFilterExec {
 }
 
 impl NdFilterExec {
-    /// Build a filter over an nd-aware `input`. `predicates` are the conjuncts to
-    /// apply (ANDed); each must be evaluable against `input`'s schema and yield a
-    /// boolean. The output schema equals the input schema — a filter selects
-    /// rows, it does not change columns.
+    /// The nd child is resolved through `registry`.
     pub fn try_new(
-        input: Arc<dyn ExecutionPlan>,
-        predicates: Vec<Arc<dyn PhysicalExpr>>,
-    ) -> Result<Self> {
-        Self::try_new_with_registry(input, predicates, NdNodeRegistry::shared_default())
-    }
-
-    /// Like [`try_new`](Self::try_new), but resolves the nd child through
-    /// `registry`.
-    pub fn try_new_with_registry(
         input: Arc<dyn ExecutionPlan>,
         predicates: Vec<Arc<dyn PhysicalExpr>>,
         registry: Arc<NdNodeRegistry>,
@@ -256,10 +244,8 @@ impl ExecutionPlan for NdFilterExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let [input] = <[_; 1]>::try_from(children).map_err(|_| {
-            DataFusionError::Internal("NdFilterExec expects exactly one child".to_string())
-        })?;
-        Ok(Arc::new(Self::try_new_with_registry(
+        let input = one_child("NdFilterExec", children)?;
+        Ok(Arc::new(Self::try_new(
             input,
             self.predicates.clone(),
             self.registry.clone(),
@@ -275,8 +261,7 @@ impl ExecutionPlan for NdFilterExec {
         // stream from `execute_nd`; a standalone execution wraps this node in an
         // `NdBroadcastExec` to materialize. In a real plan an `NdBroadcastExec`
         // sits above and pulls `execute_nd` directly, so this path is unused.
-        NdBroadcastExec::try_new_with_registry(Arc::new(self.clone()), self.registry.clone())?
-            .execute(partition, context)
+        execute_flat(self, &self.registry, partition, context)
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -285,13 +270,6 @@ impl ExecutionPlan for NdFilterExec {
     /// The nd child must stay a direct child: a repartition between two nd
     /// nodes would break the nd side channel.
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        vec![false]
-    }
-
-    /// A sort must not move below this node: below it the rows are nd
-    /// batches or encoded chunks. The order still reaches the plan through the
-    /// equivalence properties.
-    fn maintains_input_order(&self) -> Vec<bool> {
         vec![false]
     }
 }

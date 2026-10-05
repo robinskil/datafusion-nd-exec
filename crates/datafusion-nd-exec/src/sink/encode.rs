@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use arrow::array::{RecordBatch, RecordBatchOptions};
 use arrow::datatypes::{Schema, SchemaRef};
-use datafusion::error::{DataFusionError, Result};
+use datafusion::error::Result;
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -17,7 +17,7 @@ use futures::StreamExt;
 use nd_arrow_array::NdRecordBatch;
 use nd_arrow_array::encoding::{encode_nd_record_batch, encoded_schema};
 
-use crate::exec::{NdBroadcastExec, NdExecutionPlan, require_nd_input};
+use crate::exec::{NdBroadcastExec, NdExecutionPlan, one_child, require_nd_input};
 use crate::registry::NdNodeRegistry;
 
 /// A terminal that yields one `nd.array`-encoded row per nd chunk. Each chunk
@@ -33,16 +33,8 @@ pub struct NdEncodeExec {
 }
 
 impl NdEncodeExec {
-    pub fn try_new(input: Arc<dyn ExecutionPlan>) -> Result<Self> {
-        Self::try_new_with_registry(input, NdNodeRegistry::shared_default())
-    }
-
-    /// Like [`try_new`](Self::try_new), but resolves the nd child through
-    /// `registry`.
-    pub fn try_new_with_registry(
-        input: Arc<dyn ExecutionPlan>,
-        registry: Arc<NdNodeRegistry>,
-    ) -> Result<Self> {
+    /// The nd child is resolved through `registry`.
+    pub fn try_new(input: Arc<dyn ExecutionPlan>, registry: Arc<NdNodeRegistry>) -> Result<Self> {
         let nd_input = require_nd_input("NdEncodeExec", &input, &registry)?;
         let schema = Arc::new(encoded_schema(&input.schema()));
         let properties = Arc::new(
@@ -106,13 +98,8 @@ impl ExecutionPlan for NdEncodeExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let [input] = <[_; 1]>::try_from(children).map_err(|_| {
-            DataFusionError::Internal("NdEncodeExec expects exactly one child".to_string())
-        })?;
-        Ok(Arc::new(Self::try_new_with_registry(
-            input,
-            self.registry.clone(),
-        )?))
+        let input = one_child("NdEncodeExec", children)?;
+        Ok(Arc::new(Self::try_new(input, self.registry.clone())?))
     }
 
     fn execute(
@@ -144,7 +131,7 @@ pub fn nd_output_plan(plan: &Arc<dyn ExecutionPlan>) -> Result<Option<Arc<dyn Ex
     let Some(boundary) = plan.as_any().downcast_ref::<NdBroadcastExec>() else {
         return Ok(None);
     };
-    Ok(Some(Arc::new(NdEncodeExec::try_new_with_registry(
+    Ok(Some(Arc::new(NdEncodeExec::try_new(
         boundary.input().clone(),
         boundary.registry().clone(),
     )?)))

@@ -52,6 +52,7 @@ async fn a_grid_round_trips_through_the_sink() -> Result<()> {
     let rows = run(Arc::new(NdDataSinkExec::try_new(
         nd_scan(&table)?,
         sink.clone(),
+        NdNodeRegistry::shared_default(),
     )?))
     .await?;
     assert_eq!(rows, 24);
@@ -83,6 +84,7 @@ async fn profiles_append_and_pad_in_the_sink() -> Result<()> {
     let rows = run(Arc::new(NdDataSinkExec::try_new(
         nd_scan(&table)?,
         sink.clone(),
+        NdNodeRegistry::shared_default(),
     )?))
     .await?;
     // 3 x 4 cells from the first file and 2 x 3 from the second.
@@ -114,12 +116,14 @@ async fn chunks_in_reverse_order_come_out_sorted() -> Result<()> {
     run(Arc::new(NdDataSinkExec::try_new(
         nd_scan(&table)?,
         in_order.clone(),
+        NdNodeRegistry::shared_default(),
     )?))
     .await?;
     let backward = Arc::new(MemoryGridSink::new(schema));
     run(Arc::new(NdDataSinkExec::try_new(
         nd_scan(&reversed)?,
         backward.clone(),
+        NdNodeRegistry::shared_default(),
     )?))
     .await?;
 
@@ -177,6 +181,7 @@ async fn only_a_grid_sink_reads_through_the_regrid_step() -> Result<()> {
     let grid_sink = NdDataSinkExec::try_new(
         nd_scan(&table)?,
         Arc::new(MemoryGridSink::new(schema.clone())),
+        NdNodeRegistry::shared_default(),
     )?;
     let lines = displayable(&grid_sink).indent(true).to_string();
     let lines: Vec<&str> = lines.lines().map(str::trim).collect();
@@ -186,6 +191,7 @@ async fn only_a_grid_sink_reads_through_the_regrid_step() -> Result<()> {
     let counting = Arc::new(NdDataSinkExec::try_new(
         nd_scan(&table)?,
         Arc::new(CountingSink { schema }),
+        NdNodeRegistry::shared_default(),
     )?);
     let rendered = displayable(counting.as_ref()).indent(true).to_string();
     assert!(!rendered.contains("NdRegridExec"), "{rendered}");
@@ -330,7 +336,11 @@ async fn write_undeclared(sql: &str) -> Result<NdRecordBatch> {
         .downcast_ref::<NdBroadcastExec>()
         .expect("the plan ends in the nd region");
     let sink = Arc::new(MemoryGridSink::new(boundary.schema()));
-    let write = NdDataSinkExec::try_new(boundary.input().clone(), sink.clone())?;
+    let write = NdDataSinkExec::try_new(
+        boundary.input().clone(),
+        sink.clone(),
+        NdNodeRegistry::shared_default(),
+    )?;
     collect(Arc::new(write), ctx.task_ctx()).await?;
     Ok(sink.grid().expect("one grid"))
 }

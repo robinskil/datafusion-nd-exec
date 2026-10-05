@@ -18,7 +18,9 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream,
 };
 
-use crate::exec::{NdExecutionPlan, SendableNdBatchStream, merge_partitions, require_nd_input};
+use crate::exec::{
+    NdExecutionPlan, SendableNdBatchStream, merge_partitions, one_child, require_nd_input,
+};
 use crate::registry::NdNodeRegistry;
 use crate::sink::NdRegridExec;
 
@@ -76,13 +78,8 @@ pub struct NdDataSinkExec {
 }
 
 impl NdDataSinkExec {
-    pub fn try_new(input: Arc<dyn ExecutionPlan>, sink: Arc<dyn NdDataSink>) -> Result<Self> {
-        Self::try_new_with_registry(input, sink, NdNodeRegistry::shared_default())
-    }
-
-    /// Like [`try_new`](Self::try_new), but resolves the nd child through
-    /// `registry`.
-    pub fn try_new_with_registry(
+    /// The nd child is resolved through `registry`.
+    pub fn try_new(
         input: Arc<dyn ExecutionPlan>,
         sink: Arc<dyn NdDataSink>,
         registry: Arc<NdNodeRegistry>,
@@ -90,10 +87,7 @@ impl NdDataSinkExec {
         // A grid sink reads its batches through the regrid step.
         let input: Arc<dyn ExecutionPlan> =
             if sink.requires_grid() && !input.as_any().is::<NdRegridExec>() {
-                Arc::new(NdRegridExec::try_new_with_registry(
-                    input,
-                    registry.clone(),
-                )?)
+                Arc::new(NdRegridExec::try_new(input, registry.clone())?)
             } else {
                 input
             };
@@ -146,10 +140,8 @@ impl ExecutionPlan for NdDataSinkExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let [input] = <[_; 1]>::try_from(children).map_err(|_| {
-            DataFusionError::Internal("NdDataSinkExec expects exactly one child".to_string())
-        })?;
-        Ok(Arc::new(Self::try_new_with_registry(
+        let input = one_child("NdDataSinkExec", children)?;
+        Ok(Arc::new(Self::try_new(
             input,
             self.sink.clone(),
             self.registry.clone(),

@@ -17,7 +17,7 @@ use futures::StreamExt;
 use nd_arrow_array::selection::cartesian_sum;
 use nd_arrow_array::{Dimension, Dimensions, NdArrowArray, NdRecordBatch, SelectionKind};
 
-use super::{NdBroadcastExec, NdExecutionPlan, SendableNdBatchStream, require_nd_input};
+use super::{NdExecutionPlan, SendableNdBatchStream, execute_flat, one_child, require_nd_input};
 use crate::registry::NdNodeRegistry;
 
 /// How [`NdCoarsenExec`] reduces a block of cells to one value. Nulls do not
@@ -55,17 +55,8 @@ pub struct NdCoarsenExec {
 }
 
 impl NdCoarsenExec {
+    /// The nd child is resolved through `registry`.
     pub fn try_new(
-        input: Arc<dyn ExecutionPlan>,
-        factors: Vec<(String, usize)>,
-        reduce: CoarsenReduce,
-    ) -> Result<Self> {
-        Self::try_new_with_registry(input, factors, reduce, NdNodeRegistry::shared_default())
-    }
-
-    /// Like [`try_new`](Self::try_new), but resolves the nd child through
-    /// `registry`.
-    pub fn try_new_with_registry(
         input: Arc<dyn ExecutionPlan>,
         factors: Vec<(String, usize)>,
         reduce: CoarsenReduce,
@@ -274,10 +265,8 @@ impl ExecutionPlan for NdCoarsenExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let [input] = <[_; 1]>::try_from(children).map_err(|_| {
-            DataFusionError::Internal("NdCoarsenExec expects exactly one child".to_string())
-        })?;
-        Ok(Arc::new(Self::try_new_with_registry(
+        let input = one_child("NdCoarsenExec", children)?;
+        Ok(Arc::new(Self::try_new(
             input,
             self.factors.clone(),
             self.reduce,
@@ -290,8 +279,7 @@ impl ExecutionPlan for NdCoarsenExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        NdBroadcastExec::try_new_with_registry(Arc::new(self.clone()), self.registry.clone())?
-            .execute(partition, context)
+        execute_flat(self, &self.registry, partition, context)
     }
 
     /// The nd child must stay a direct child.
@@ -336,13 +324,18 @@ mod tests {
             .into_iter()
             .map(|(axis, f)| (axis.to_string(), f))
             .collect();
-        NdCoarsenExec::try_new(scan.children()[0].clone(), factors, reduce)
-            .unwrap()
-            .execute_nd(0, Arc::new(TaskContext::default()))
-            .unwrap()
-            .try_collect()
-            .await
-            .unwrap()
+        NdCoarsenExec::try_new(
+            scan.children()[0].clone(),
+            factors,
+            reduce,
+            NdNodeRegistry::shared_default(),
+        )
+        .unwrap()
+        .execute_nd(0, Arc::new(TaskContext::default()))
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap()
     }
 
     fn column<'a>(batch: &'a NdRecordBatch, name: &str) -> &'a NdArrowArray {
@@ -415,6 +408,7 @@ mod tests {
             scan.children()[0].clone(),
             vec![("lat".to_string(), 0)],
             CoarsenReduce::Mean,
+            NdNodeRegistry::shared_default(),
         );
         assert!(result.is_err());
     }

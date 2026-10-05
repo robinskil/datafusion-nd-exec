@@ -13,7 +13,7 @@ use datafusion::physical_plan::{
 };
 use nd_arrow_array::SelectionKind;
 
-use super::{NdBroadcastExec, NdExecutionPlan, SendableNdBatchStream, require_nd_input};
+use super::{NdExecutionPlan, SendableNdBatchStream, execute_flat, one_child, require_nd_input};
 use crate::registry::NdNodeRegistry;
 
 /// Merge all partitions of an nd input into one partition. The batches come
@@ -27,16 +27,8 @@ pub struct NdCoalescePartitionsExec {
 }
 
 impl NdCoalescePartitionsExec {
-    pub fn try_new(input: Arc<dyn ExecutionPlan>) -> Result<Self> {
-        Self::try_new_with_registry(input, NdNodeRegistry::shared_default())
-    }
-
-    /// Like [`try_new`](Self::try_new), but resolves the nd child through
-    /// `registry`.
-    pub fn try_new_with_registry(
-        input: Arc<dyn ExecutionPlan>,
-        registry: Arc<NdNodeRegistry>,
-    ) -> Result<Self> {
+    /// The nd child is resolved through `registry`.
+    pub fn try_new(input: Arc<dyn ExecutionPlan>, registry: Arc<NdNodeRegistry>) -> Result<Self> {
         let nd_input = require_nd_input("NdCoalescePartitionsExec", &input, &registry)?;
         // The merge interleaves the partitions, so no order survives.
         let properties = Arc::new(
@@ -95,15 +87,8 @@ impl ExecutionPlan for NdCoalescePartitionsExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let [input] = <[_; 1]>::try_from(children).map_err(|_| {
-            DataFusionError::Internal(
-                "NdCoalescePartitionsExec expects exactly one child".to_string(),
-            )
-        })?;
-        Ok(Arc::new(Self::try_new_with_registry(
-            input,
-            self.registry.clone(),
-        )?))
+        let input = one_child("NdCoalescePartitionsExec", children)?;
+        Ok(Arc::new(Self::try_new(input, self.registry.clone())?))
     }
 
     fn execute(
@@ -111,8 +96,7 @@ impl ExecutionPlan for NdCoalescePartitionsExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        NdBroadcastExec::try_new_with_registry(Arc::new(self.clone()), self.registry.clone())?
-            .execute(partition, context)
+        execute_flat(self, &self.registry, partition, context)
     }
 
     /// The nd child must stay a direct child.

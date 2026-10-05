@@ -32,7 +32,9 @@ use nd_arrow_array::{
     NdRecordBatch, SelectionKind,
 };
 
-use crate::exec::{NdBroadcastExec, NdExecutionPlan, SendableNdBatchStream, require_nd_input};
+use crate::exec::{
+    NdExecutionPlan, SendableNdBatchStream, execute_flat, one_child, require_nd_input,
+};
 use crate::registry::NdNodeRegistry;
 
 /// Collects all nd batches of its input, builds the output grids, and sends
@@ -50,16 +52,8 @@ pub struct NdRegridExec {
 }
 
 impl NdRegridExec {
-    pub fn try_new(input: Arc<dyn ExecutionPlan>) -> Result<Self> {
-        Self::try_new_with_registry(input, NdNodeRegistry::shared_default())
-    }
-
-    /// Like [`try_new`](Self::try_new), but resolves the nd child through
-    /// `registry`.
-    pub fn try_new_with_registry(
-        input: Arc<dyn ExecutionPlan>,
-        registry: Arc<NdNodeRegistry>,
-    ) -> Result<Self> {
+    /// The nd child is resolved through `registry`.
+    pub fn try_new(input: Arc<dyn ExecutionPlan>, registry: Arc<NdNodeRegistry>) -> Result<Self> {
         let nd_input = require_nd_input("NdRegridExec", &input, &registry)?;
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(input.schema()),
@@ -310,13 +304,8 @@ impl ExecutionPlan for NdRegridExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let [input] = <[_; 1]>::try_from(children).map_err(|_| {
-            DataFusionError::Internal("NdRegridExec expects exactly one child".to_string())
-        })?;
-        Ok(Arc::new(Self::try_new_with_registry(
-            input,
-            self.registry.clone(),
-        )?))
+        let input = one_child("NdRegridExec", children)?;
+        Ok(Arc::new(Self::try_new(input, self.registry.clone())?))
     }
 
     fn execute(
@@ -324,8 +313,7 @@ impl ExecutionPlan for NdRegridExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        NdBroadcastExec::try_new_with_registry(Arc::new(self.clone()), self.registry.clone())?
-            .execute(partition, context)
+        execute_flat(self, &self.registry, partition, context)
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -393,7 +381,7 @@ mod tests {
     }
 
     async fn regrid(context: Arc<TaskContext>) -> (NdRegridExec, Vec<NdRecordBatch>) {
-        let exec = NdRegridExec::try_new(source()).unwrap();
+        let exec = NdRegridExec::try_new(source(), NdNodeRegistry::shared_default()).unwrap();
         let batches = exec
             .execute_nd(0, context)
             .unwrap()
@@ -464,7 +452,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_node_has_one_partition() {
-        let exec = NdRegridExec::try_new(source()).unwrap();
+        let exec = NdRegridExec::try_new(source(), NdNodeRegistry::shared_default()).unwrap();
         assert_eq!(exec.properties().partitioning.partition_count(), 1);
         assert!(
             exec.execute_nd(1, Arc::new(TaskContext::default()))
@@ -479,7 +467,9 @@ mod tests {
             .unwrap()
             .nd_scan(Some(&vec![0, 1, 3]), NdNodeRegistry::shared_default())
             .unwrap();
-        let exec = NdRegridExec::try_new(scan.children()[0].clone()).unwrap();
+        let exec =
+            NdRegridExec::try_new(scan.children()[0].clone(), NdNodeRegistry::shared_default())
+                .unwrap();
         let stream = exec
             .execute_nd(0, Arc::new(TaskContext::default()))
             .unwrap();

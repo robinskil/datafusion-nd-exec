@@ -60,7 +60,7 @@ impl NdSinker for FilterSinker {
             return Ok(None);
         }
 
-        let nd_filter: Arc<dyn NdExecutionPlan> = Arc::new(NdFilterExec::try_new_with_registry(
+        let nd_filter: Arc<dyn NdExecutionPlan> = Arc::new(NdFilterExec::try_new(
             child.clone(),
             push,
             registry.clone(),
@@ -80,7 +80,7 @@ impl NdSinker for FilterSinker {
                             (column, name)
                         })
                         .collect();
-                    Arc::new(NdProjectionExec::try_new_with_registry(
+                    Arc::new(NdProjectionExec::try_new(
                         nd_filter,
                         exprs,
                         Some(filter.schema()),
@@ -90,12 +90,9 @@ impl NdSinker for FilterSinker {
             };
             let nd: Arc<dyn NdExecutionPlan> = match filter.fetch() {
                 None => nd,
-                Some(fetch) => Arc::new(NdLimitExec::try_new_with_registry(
-                    nd,
-                    0,
-                    Some(fetch),
-                    registry.clone(),
-                )?),
+                Some(fetch) => {
+                    Arc::new(NdLimitExec::try_new(nd, 0, Some(fetch), registry.clone())?)
+                }
             };
             return Ok(Some(Sunk::Below { nd, residual: None }));
         }
@@ -151,7 +148,7 @@ impl NdSinker for ProjectionSinker {
             .map(|pe| (pe.expr.clone(), pe.alias.clone()))
             .collect();
         // Keep the exact output schema, so the rewrite passes the schema check.
-        let nd = NdProjectionExec::try_new_with_registry(
+        let nd = NdProjectionExec::try_new(
             child.clone(),
             exprs,
             Some(projection.schema()),
@@ -194,7 +191,7 @@ impl NdSinker for UnionSinker {
         if children.iter().any(|child| child.schema() != schema) {
             return Ok(None);
         }
-        let nd = NdUnionExec::try_new_with_registry(children.to_vec(), registry.clone())?;
+        let nd = NdUnionExec::try_new(children.to_vec(), registry.clone())?;
         Ok(Some(Sunk::Below {
             nd: Arc::new(nd),
             residual: None,
@@ -235,7 +232,7 @@ impl NdSinker for LimitSinker {
         } else {
             return Ok(None);
         };
-        let nd = NdLimitExec::try_new_with_registry(child.clone(), skip, fetch, registry.clone())?;
+        let nd = NdLimitExec::try_new(child.clone(), skip, fetch, registry.clone())?;
         Ok(Some(Sunk::Below {
             nd: Arc::new(nd),
             residual: None,
@@ -274,8 +271,7 @@ impl NdSinker for RepartitionSinker {
         if repartition.preserve_order() {
             return Ok(None);
         }
-        let nd =
-            NdRepartitionExec::try_new_with_registry(child.clone(), *partitions, registry.clone())?;
+        let nd = NdRepartitionExec::try_new(child.clone(), *partitions, registry.clone())?;
         Ok(Some(Sunk::Below {
             nd: Arc::new(nd),
             residual: None,
@@ -307,12 +303,13 @@ impl NdSinker for CoalesceSinker {
         let Some(coalesce) = parent.as_any().downcast_ref::<CoalescePartitionsExec>() else {
             return Ok(None);
         };
-        let merged: Arc<dyn NdExecutionPlan> = Arc::new(
-            NdCoalescePartitionsExec::try_new_with_registry(child.clone(), registry.clone())?,
-        );
+        let merged: Arc<dyn NdExecutionPlan> = Arc::new(NdCoalescePartitionsExec::try_new(
+            child.clone(),
+            registry.clone(),
+        )?);
         let nd: Arc<dyn NdExecutionPlan> = match coalesce.fetch() {
             None => merged,
-            Some(fetch) => Arc::new(NdLimitExec::try_new_with_registry(
+            Some(fetch) => Arc::new(NdLimitExec::try_new(
                 merged,
                 0,
                 Some(fetch),
@@ -354,8 +351,7 @@ impl NdSinker for DataSinkSinker {
         else {
             return Ok(None);
         };
-        let terminal =
-            NdDataSinkExec::try_new_with_registry(child.clone(), sink, registry.clone())?;
+        let terminal = NdDataSinkExec::try_new(child.clone(), sink, registry.clone())?;
         Ok(Some(Sunk::Terminal(Arc::new(terminal))))
     }
 }

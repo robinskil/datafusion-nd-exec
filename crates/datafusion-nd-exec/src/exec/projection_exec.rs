@@ -36,7 +36,7 @@ use nd_arrow_array::SelectionKind;
 use nd_arrow_array::batch::NdRecordBatch;
 
 use super::expr_column::{NdExprColumn, ProjectMetrics};
-use super::{NdBroadcastExec, NdExecutionPlan, SendableNdBatchStream, require_nd_input};
+use super::{NdExecutionPlan, SendableNdBatchStream, execute_flat, one_child, require_nd_input};
 use crate::registry::NdNodeRegistry;
 
 /// Projects a list of element-wise expressions over un-broadcast nd batches,
@@ -62,36 +62,12 @@ pub struct NdProjectionExec {
 }
 
 impl NdProjectionExec {
-    /// Build a projection over an nd-aware `input`. `exprs` are `(expr, alias)`
-    /// pairs; each expression must be evaluable against `input`'s schema. The
-    /// output schema is derived from the expressions.
+    /// A projection over an nd-aware `input`. `exprs` are `(expr, alias)`
+    /// pairs, and each expression must evaluate against the schema of `input`.
+    /// A given `output_schema` is the output schema as it is, so a rewrite of
+    /// a `ProjectionExec` keeps its exact schema. With `None`, the schema comes
+    /// from the expressions. The nd child is resolved through `registry`.
     pub fn try_new(
-        input: Arc<dyn ExecutionPlan>,
-        exprs: Vec<(Arc<dyn PhysicalExpr>, String)>,
-    ) -> Result<Self> {
-        Self::try_new_with_schema(input, exprs, None)
-    }
-
-    /// Like [`try_new`](Self::try_new), but adopts `output_schema` verbatim when
-    /// provided. The pushdown rule passes the `ProjectionExec`'s exact schema so
-    /// the rewrite preserves field metadata and the optimizer's schema check
-    /// holds. When `None`, the schema is derived from the expressions.
-    pub fn try_new_with_schema(
-        input: Arc<dyn ExecutionPlan>,
-        exprs: Vec<(Arc<dyn PhysicalExpr>, String)>,
-        output_schema: Option<SchemaRef>,
-    ) -> Result<Self> {
-        Self::try_new_with_registry(
-            input,
-            exprs,
-            output_schema,
-            NdNodeRegistry::shared_default(),
-        )
-    }
-
-    /// Like [`try_new_with_schema`](Self::try_new_with_schema), but resolves
-    /// the nd child through `registry`.
-    pub fn try_new_with_registry(
         input: Arc<dyn ExecutionPlan>,
         exprs: Vec<(Arc<dyn PhysicalExpr>, String)>,
         output_schema: Option<SchemaRef>,
@@ -218,10 +194,8 @@ impl ExecutionPlan for NdProjectionExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let [input] = <[_; 1]>::try_from(children).map_err(|_| {
-            DataFusionError::Internal("NdProjectionExec expects exactly one child".to_string())
-        })?;
-        Ok(Arc::new(Self::try_new_with_registry(
+        let input = one_child("NdProjectionExec", children)?;
+        Ok(Arc::new(Self::try_new(
             input,
             self.exprs.clone(),
             Some(self.schema.clone()),
@@ -245,8 +219,7 @@ impl ExecutionPlan for NdProjectionExec {
         // an `NdBroadcastExec` sits at the top and pulls this node's `execute_nd`
         // directly (through any nd operators in between), so this path is never
         // taken — the broadcast stays a separate, single terminal node.
-        NdBroadcastExec::try_new_with_registry(Arc::new(self.clone()), self.registry.clone())?
-            .execute(partition, context)
+        execute_flat(self, &self.registry, partition, context)
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -255,13 +228,6 @@ impl ExecutionPlan for NdProjectionExec {
     /// The nd child must stay a direct child: a repartition between two nd
     /// nodes would break the nd side channel.
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        vec![false]
-    }
-
-    /// A sort must not move below this node: below it the rows are nd
-    /// batches or encoded chunks. The order still reaches the plan through the
-    /// equivalence properties.
-    fn maintains_input_order(&self) -> Vec<bool> {
         vec![false]
     }
 }
@@ -328,9 +294,13 @@ mod tests {
         let schema = test_schema();
         let flat = MemorySourceConfig::try_new_exec(&[vec![]], schema.clone(), None).unwrap();
 
-        let err =
-            NdProjectionExec::try_new(flat, vec![(col("lat", &schema).unwrap(), "lat".into())])
-                .unwrap_err();
+        let err = NdProjectionExec::try_new(
+            flat,
+            vec![(col("lat", &schema).unwrap(), "lat".into())],
+            None,
+            NdNodeRegistry::shared_default(),
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("nd-aware"),
             "unexpected error: {err}"
@@ -359,8 +329,13 @@ mod tests {
             true,
         )]));
         assert!(
-            NdProjectionExec::try_new_with_schema(source.clone(), exprs.clone(), Some(wrong))
-                .is_err()
+            NdProjectionExec::try_new(
+                source.clone(),
+                exprs.clone(),
+                Some(wrong),
+                NdNodeRegistry::shared_default()
+            )
+            .is_err()
         );
 
         // A schema differing only in field metadata is accepted.
@@ -368,8 +343,13 @@ mod tests {
             Field::new("lat", DataType::Int32, true)
                 .with_metadata([("units".to_string(), "degrees_north".to_string())].into()),
         ]));
-        let projection =
-            NdProjectionExec::try_new_with_schema(source, exprs, Some(annotated.clone())).unwrap();
+        let projection = NdProjectionExec::try_new(
+            source,
+            exprs,
+            Some(annotated.clone()),
+            NdNodeRegistry::shared_default(),
+        )
+        .unwrap();
         assert_eq!(projection.schema(), annotated);
     }
 }

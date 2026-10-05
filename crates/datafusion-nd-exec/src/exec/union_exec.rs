@@ -13,7 +13,7 @@ use datafusion::physical_plan::{
 };
 use nd_arrow_array::SelectionKind;
 
-use super::{NdBroadcastExec, NdExecutionPlan, SendableNdBatchStream, require_nd_input};
+use super::{NdExecutionPlan, SendableNdBatchStream, execute_flat, require_nd_input};
 use crate::registry::NdNodeRegistry;
 
 /// The partitions of all nd inputs in sequence. Each chunk keeps its own
@@ -29,14 +29,8 @@ pub struct NdUnionExec {
 }
 
 impl NdUnionExec {
-    /// A union of `inputs`. All inputs must have the same schema.
-    pub fn try_new(inputs: Vec<Arc<dyn ExecutionPlan>>) -> Result<Self> {
-        Self::try_new_with_registry(inputs, NdNodeRegistry::shared_default())
-    }
-
-    /// Like [`try_new`](Self::try_new), but resolves the nd inputs through
-    /// `registry`.
-    pub fn try_new_with_registry(
+    /// The nd inputs are resolved through `registry`.
+    pub fn try_new(
         inputs: Vec<Arc<dyn ExecutionPlan>>,
         registry: Arc<NdNodeRegistry>,
     ) -> Result<Self> {
@@ -108,10 +102,7 @@ impl ExecutionPlan for NdUnionExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self::try_new_with_registry(
-            children,
-            self.registry.clone(),
-        )?))
+        Ok(Arc::new(Self::try_new(children, self.registry.clone())?))
     }
 
     fn execute(
@@ -119,8 +110,7 @@ impl ExecutionPlan for NdUnionExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        NdBroadcastExec::try_new_with_registry(Arc::new(self.clone()), self.registry.clone())?
-            .execute(partition, context)
+        execute_flat(self, &self.registry, partition, context)
     }
 
     /// The nd inputs must stay direct children.

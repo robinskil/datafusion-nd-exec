@@ -234,7 +234,7 @@ complete, runnable version is
    ```rust
    let source = Arc::new(NdSourceExec::try_new(file_scan)?);
    let registry = NdNodeRegistry::from_session_config(state.config());
-   let plan = NdBroadcastExec::try_new_with_registry(source, registry)?;
+   let plan = NdBroadcastExec::try_new(source, registry)?;
    ```
 
    Call `NdSourceExec::with_ordered_chunks()` only when each partition yields

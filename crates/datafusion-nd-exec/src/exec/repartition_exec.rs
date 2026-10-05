@@ -17,7 +17,7 @@ use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use nd_arrow_array::{NdRecordBatch, SelectionKind};
 
-use super::{NdBroadcastExec, NdExecutionPlan, SendableNdBatchStream, require_nd_input};
+use super::{NdExecutionPlan, SendableNdBatchStream, execute_flat, one_child, require_nd_input};
 use crate::registry::NdNodeRegistry;
 
 type Item = Result<NdRecordBatch>;
@@ -58,13 +58,8 @@ impl fmt::Debug for Channels {
 }
 
 impl NdRepartitionExec {
-    pub fn try_new(input: Arc<dyn ExecutionPlan>, partitions: usize) -> Result<Self> {
-        Self::try_new_with_registry(input, partitions, NdNodeRegistry::shared_default())
-    }
-
-    /// Like [`try_new`](Self::try_new), but resolves the nd child through
-    /// `registry`.
-    pub fn try_new_with_registry(
+    /// The nd child is resolved through `registry`.
+    pub fn try_new(
         input: Arc<dyn ExecutionPlan>,
         partitions: usize,
         registry: Arc<NdNodeRegistry>,
@@ -167,10 +162,8 @@ impl ExecutionPlan for NdRepartitionExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let [input] = <[_; 1]>::try_from(children).map_err(|_| {
-            DataFusionError::Internal("NdRepartitionExec expects exactly one child".to_string())
-        })?;
-        Ok(Arc::new(Self::try_new_with_registry(
+        let input = one_child("NdRepartitionExec", children)?;
+        Ok(Arc::new(Self::try_new(
             input,
             self.partitions,
             self.registry.clone(),
@@ -182,8 +175,7 @@ impl ExecutionPlan for NdRepartitionExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        NdBroadcastExec::try_new_with_registry(Arc::new(self.clone()), self.registry.clone())?
-            .execute(partition, context)
+        execute_flat(self, &self.registry, partition, context)
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -254,7 +246,8 @@ mod tests {
             .nd_scan(None, NdNodeRegistry::shared_default())
             .unwrap();
         let source = scan.children()[0].clone();
-        let repartition = NdRepartitionExec::try_new(source, 3).unwrap();
+        let repartition =
+            NdRepartitionExec::try_new(source, 3, NdNodeRegistry::shared_default()).unwrap();
         let context = Arc::new(TaskContext::default());
 
         // Read the outputs in sequence: the unbounded channels must not block.
@@ -279,7 +272,8 @@ mod tests {
             .nd_scan(None, NdNodeRegistry::shared_default())
             .unwrap();
         let source = scan.children()[0].clone();
-        let repartition = NdRepartitionExec::try_new(source, 2).unwrap();
+        let repartition =
+            NdRepartitionExec::try_new(source, 2, NdNodeRegistry::shared_default()).unwrap();
         let context = Arc::new(TaskContext::default());
         assert!(repartition.execute_nd(0, context.clone()).is_ok());
         assert!(repartition.execute_nd(0, context).is_err());
@@ -291,7 +285,12 @@ mod tests {
             .unwrap()
             .nd_scan(None, NdNodeRegistry::shared_default())
             .unwrap();
-        let repartition = NdRepartitionExec::try_new(scan.children()[0].clone(), 2).unwrap();
+        let repartition = NdRepartitionExec::try_new(
+            scan.children()[0].clone(),
+            2,
+            NdNodeRegistry::shared_default(),
+        )
+        .unwrap();
         let context = Arc::new(TaskContext::default());
         for _ in 0..2 {
             let mut rows = 0;

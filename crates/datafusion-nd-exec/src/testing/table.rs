@@ -153,8 +153,6 @@ impl NdMemTable {
         } else {
             source
         });
-        Ok(Arc::new(NdBroadcastExec::try_new_with_registry(
-            source, registry,
-        )?))
+        Ok(Arc::new(NdBroadcastExec::try_new(source, registry)?))
     }
 }

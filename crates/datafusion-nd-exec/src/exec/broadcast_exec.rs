@@ -5,7 +5,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use datafusion::common::config::ConfigOptions;
-use datafusion::error::{DataFusionError, Result};
+use datafusion::error::Result;
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::filter_pushdown::{
@@ -18,7 +18,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 
-use super::{NdExecutionPlan, materialize_nd_stream, require_nd_input};
+use super::{NdExecutionPlan, materialize_nd_stream, one_child, require_nd_input};
 use crate::registry::NdNodeRegistry;
 
 /// Boundary between the nd pipeline and the rest of the plan: pulls nd
@@ -36,16 +36,8 @@ pub struct NdBroadcastExec {
 }
 
 impl NdBroadcastExec {
-    /// Build a broadcast over `input`, resolved through the default registry.
-    pub fn try_new(input: Arc<dyn ExecutionPlan>) -> Result<Self> {
-        Self::try_new_with_registry(input, NdNodeRegistry::shared_default())
-    }
-
     /// Build a broadcast over `input`, resolved through `registry`.
-    pub fn try_new_with_registry(
-        input: Arc<dyn ExecutionPlan>,
-        registry: Arc<NdNodeRegistry>,
-    ) -> Result<Self> {
+    pub fn try_new(input: Arc<dyn ExecutionPlan>, registry: Arc<NdNodeRegistry>) -> Result<Self> {
         let nd_input = require_nd_input("NdBroadcastExec", &input, &registry)?;
         let properties = input.properties().clone();
         Ok(Self {
@@ -115,13 +107,8 @@ impl ExecutionPlan for NdBroadcastExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let [input] = <[_; 1]>::try_from(children).map_err(|_| {
-            DataFusionError::Internal("NdBroadcastExec expects exactly one child".to_string())
-        })?;
-        Ok(Arc::new(Self::try_new_with_registry(
-            input,
-            self.registry.clone(),
-        )?))
+        let input = one_child("NdBroadcastExec", children)?;
+        Ok(Arc::new(Self::try_new(input, self.registry.clone())?))
     }
 
     fn execute(
@@ -178,13 +165,6 @@ impl ExecutionPlan for NdBroadcastExec {
     /// The nd child must stay a direct child: a repartition between two nd
     /// nodes would break the nd side channel.
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        vec![false]
-    }
-
-    /// A sort must not move below this node: below it the rows are nd
-    /// batches or encoded chunks. The order still reaches the plan through the
-    /// equivalence properties.
-    fn maintains_input_order(&self) -> Vec<bool> {
         vec![false]
     }
 }
