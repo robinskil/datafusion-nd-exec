@@ -29,12 +29,35 @@ grid too.
 
 | Crate | Content | Depends on |
 |---|---|---|
-| `nd-arrow-array` | The nd data types: `NdArrowArray`, `NdRecordBatch`, `Dimensions` with axis metadata, the `Selection` lattice, `BroadcastMap`, and the `nd.array` Arrow extension type with its encoding. | `arrow` |
+| `nd-arrow-array` | The nd data types: `NdArrowArray`, `NdRecordBatch`, `Dimensions` with axis metadata, the `Selection` lattice, `BroadcastMap`, the `nd.array` Arrow extension type with its encoding, and the output grids: `NdOutputGrid`, `NdPlacement` and `NdGridBuilder`. | `arrow` |
 | `datafusion-nd-exec` | The nd plan nodes, the node registry, the `NdBoundaryRule`, the output terminals, the regrid step, axis ranges for readers, and a test harness (feature `test-utils`). It re-exports `nd-arrow-array` as `datafusion_nd_exec::array`. | `nd-arrow-array`, `datafusion` |
 
 Both crates target DataFusion 53 and Arrow 58.
 
 ## How it works
+
+### The path of a query
+
+```text
+files -> DataSourceExec -> NdSourceExec -> nd nodes ------------> NdBroadcastExec -> flat nodes -> rows
+         one encoded row   nd batches      filter, projection,   the boundary       aggregate,
+         per chunk                         limit, union, ...                        sort, join
+                                              |
+                                              +--> NdEncodeExec ----------------------> encoded chunks
+                                              |
+                                              +--> NdDataSinkExec -> NdDataSink         streams the chunks
+                                              |
+                                              +--> NdDataSinkExec -> NdRegridExec ----> a grid sink
+                                                                     (one output grid)
+```
+
+1. A format reads its files in chunks. Each chunk goes through DataFusion as one row of Arrow data.
+2. `NdSourceExec` decodes each row into an nd batch: a grid with its columns, without repeated values.
+3. The nd nodes run on the grid. They change the selection of a chunk, not its data.
+4. The data leaves the nd region in one of three ways:
+   - `NdBroadcastExec` makes flat rows, where a flat operator needs them.
+   - `NdEncodeExec` sends the chunks to a client as they are.
+   - `NdDataSinkExec` writes the chunks with an `NdDataSink`. A grid sink gets all chunks with their place in one output grid.
 
 ### The nd batch
 
@@ -121,6 +144,43 @@ column counts as selected. For a table with `sst` on `time, lat, lon` and
 
 A column that a file does not have decodes as a null on no axis, so it is null
 in every row of that file.
+
+### Follow one query
+
+The test table `grid_table` has two chunks. Each chunk has the grid
+`time=2, lat=3, lon=2`, with `sst` on all three axes. The query:
+
+```sql
+SELECT time, lat, lon, sst FROM t WHERE lat > 0
+```
+
+1. **Plan.** DataFusion plans a `FilterExec` over a round-robin `RepartitionExec` over the scan. The `NdBoundaryRule` moves both below the boundary. The scan reads only the selected columns, so the plan needs no projection node:
+
+   ```text
+   NdBroadcastExec: region=[NdFilterExec, NdRepartitionExec, NdSourceExec]
+     NdFilterExec: predicate=[lat@1 > 0]
+       NdRepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=2
+         NdSourceExec
+           DataSourceExec: partitions=2, partition_sizes=[1, 1]
+   ```
+
+2. **Scan.** Each partition yields one encoded row. `NdSourceExec` decodes it into an nd batch with the grid `time=2, lat=3, lon=2` and a `Full` selection. The columns hold 2, 3, 2 and 12 values.
+3. **Repartition.** `NdRepartitionExec` sends each chunk whole to one output partition.
+4. **Filter.** `lat > 0` reads the `lat` column only, so it compares 3 values, not 12 cells. The result is an `AxisIndices` selection with `lat = [2]`: a rectangle of 2 x 1 x 2 cells.
+5. **Boundary.** `NdBroadcastExec` gathers each column at the 4 kept cells of each chunk. The query gives 8 rows, and no other cell is built.
+
+To write the same result as one grid, a grid sink replaces the boundary:
+
+```text
+NdDataSinkExec: sink=MemoryGridSink
+  NdRegridExec
+    NdFilterExec: predicate=[lat@1 > 0]
+      ...
+```
+
+6. **Compact.** `NdRegridExec` compacts each chunk. The rectangle becomes a dense block of `time=2, lat=1, lon=2`.
+7. **Regrid.** The union of the coordinates gives `time = 100, 101, 102, 103`, `lat = 30` and `lon = 5, 15`, so the output grid is `time=4, lat=1, lon=2`. The first chunk goes at `time 0..=1`, the second at `time 2..=3`.
+8. **Write.** The sink gets both chunks with their placements and writes 8 cells. Two `sst` cells are null, because the test table has a null at every seventh cell.
 
 ## Use
 
@@ -236,10 +296,14 @@ A sort order needs the same grid in every file: a format must not call
   returns `None` when flat operators, for example an aggregate, run above the
   nd region.
 
-Both terminals first compact each chunk with `NdRecordBatch::compact`:
+`NdEncodeExec` and `NdRegridExec` compact each chunk with
+`NdRecordBatch::compact`:
 
 - A rectangle selection becomes a smaller dense grid.
 - A ragged or cell-mask selection keeps its grid, and each full-grid column gets null at the dropped cells.
+
+A sink without `requires_grid` gets each chunk as it is, with its selection.
+It calls `compact()` or `materialize()` itself.
 
 ### The regrid step
 
@@ -288,6 +352,31 @@ while let Some(chunk) = data.next().await {
 `NdGridBuilder` in `nd-arrow-array` holds the rules below. It uses Arrow only,
 so a host can use it without DataFusion.
 
+### Write a grid sink
+
+1. **Implement `NdDataSink`** and return `true` from `requires_grid`.
+2. **Open each output grid once.** Chunks of one grid share one `Arc<NdOutputGrid>`, so compare with `Arc::ptr_eq`. For a new grid, create the output arrays with the shape `grid.dims().shape()`, and write the coordinate arrays from `grid.coordinates()`.
+3. **Write each column on its own axes.** A column lives on a subset of the grid axes. Take the positions of those axes from `placement.axis_indices(name)`.
+   - When the positions rise by 1 on every axis, the chunk is one block. Write it at the first position of each axis, as one hyperslab or one region.
+   - Otherwise, write it in parts. Each part is a run of positions that rise by 1.
+   - A column on no axis, for example a null for a file that lacks the column, has no cells to write. The output keeps its fill value there.
+4. **Connect the sink.** For `COPY TO` or `INSERT`, map the flat `DataSink` of your host to your sink with an `NdSinkFactory`, and add the factory to the registry:
+
+   ```rust
+   let registry = Arc::new(NdNodeRegistry::new().with_sink_factory(Arc::new(MyFactory)));
+   let state = SessionStateBuilder::new()
+       .with_default_features()
+       .with_nd_pipeline(registry)
+       .build();
+   ```
+
+   Or plan the write yourself: `NdDataSinkExec::try_new(nd_child_of_the_boundary, sink)`.
+5. **Set the memory.** `NdRegridExec` holds the chunks until the input ends, and spills when the memory pool is full. Give the session a memory limit and a disk manager, for example `RuntimeEnvBuilder::new().with_memory_limit(4 << 30, 1.0)`. The default disk manager writes the spill files to the temp directory of the OS.
+
+`testing::MemoryGridSink` follows these steps in memory, and
+[examples/profiles.rs](crates/datafusion-nd-exec/examples/profiles.rs) has a
+sink that prints each step.
+
 ### The grid rules
 
 **Groups:** chunks with the same axis names in the same order make one group.
@@ -306,6 +395,10 @@ not select:
 - The outer axis appends: each chunk gets the next range. The order is the input partition, then the chunk number in that partition, so it does not change between runs.
 - Each inner axis pads to the largest size, with each chunk at index 0.
 
+Select the coordinate column of each inner axis for a grid sink. Without it,
+the inner axis pads. A chunk that a filter cuts on that axis then starts at
+index 0, which is not its true place.
+
 **Sparse grids:** each cell that no chunk writes is null. So chunks with
 other grids, for example two regions, fill one union grid.
 
@@ -314,6 +407,23 @@ both chunks and the cell ranges. Columns on fewer axes do not count, so two
 spatial tiles can write the same `time` values.
 
 ### Examples
+
+**Many Zarr stores into one store.** A collection holds many Zarr stores on
+`time, lat, lon`. All stores have the same `lat` and `lon`, but each store has
+other days. The query:
+
+```sql
+COPY (SELECT time, lat, lon, sst FROM stores WHERE time >= '2020-01-01') TO 'all.zarr'
+```
+
+1. The Zarr reader yields chunks with axis metadata: `time`, `lat` and `lon` each name their coordinate column. It can skip the stores and chunks before 2020 with `axis_ranges`.
+2. The `NdSinkFactory` of the host maps the `COPY TO` sink to a Zarr grid sink. The plan is `NdDataSinkExec` over `NdRegridExec` over the nd region.
+3. `NdRegridExec` collects all chunks and spills them when the memory is full. Only the records of the chunks stay in memory: their axis sizes and coordinate values.
+4. The regrid joins the days of all stores into one sorted `time` axis. `lat` and `lon` are equal in all stores, so the union keeps them as they are. Two stores with the same day fail with an overlap error.
+5. The sink creates `all.zarr` with the shape `[days, lat, lon]` and writes `time`, `lat` and `lon` from the grid. Then it writes each chunk at its `time` positions.
+
+The arrival order of the stores does not matter, and no metadata is necessary
+before the query runs.
 
 **Daily grid files** `time, lat, lon`, one day per file, in any order: the
 output `time` axis holds all days in ascending order. `lat` and `lon` are the
@@ -378,7 +488,8 @@ cargo run -p datafusion-nd-exec --example profiles
 ## Limits
 
 - A grid sink writes nothing until its input ends. Spilled chunks go to disk once and come back once. The input must be bounded.
-- `NdRegridExec` sends whole chunks, not blocks that match the storage chunks of the output.
+- `NdRegridExec` sends whole chunks, not blocks that match the storage chunks of the output. A Zarr sink must read, change and write a storage chunk again when a chunk covers only part of it.
+- An inner axis whose coordinate column the query does not select pads, so a chunk that a filter cuts on that axis goes to index 0.
 - The spatial box of `st_within` and `st_intersects` does not narrow axes yet.
 - `NdRepartitionExec` uses unbounded channels, so memory is not limited when a consumer is slow.
 - A filter adds a round-robin repartition, which loses the order, so `WHERE ... ORDER BY time` still sorts. The flat path does the same.
