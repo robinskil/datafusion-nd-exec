@@ -24,5 +24,5 @@ pub use broadcast::BroadcastMap;
 pub use dimensions::{Dimension, Dimensions};
 pub use error::{ArrowError, Result};
 pub use extension::{NdArrayMetadata, NdArrayType};
-pub use grid::{NdOutputGrid, NdPlacement};
+pub use grid::{NdBatchRecord, NdGridBuilder, NdOutputGrid, NdPlacement};
 pub use selection::{Selection, SelectionKind};

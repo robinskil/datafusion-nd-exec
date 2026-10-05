@@ -1,11 +1,15 @@
 //! Output grids of a regrid step, and the place of a batch in one.
 
+mod builder;
+
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, UInt64Array};
 
 use crate::dimensions::Dimensions;
 use crate::error::{Result, nd_err};
+
+pub use builder::{NdBatchRecord, NdGridBuilder};
 
 /// One output grid: its axes and the coordinate values of each axis.
 #[derive(Debug, Clone)]
