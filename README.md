@@ -30,7 +30,7 @@ grid too.
 | Crate | Content | Depends on |
 |---|---|---|
 | `nd-arrow-array` | The nd data types: `NdArrowArray`, `NdRecordBatch`, `Dimensions` with axis metadata, the `Selection` lattice, `BroadcastMap`, and the `nd.array` Arrow extension type with its encoding. | `arrow` |
-| `datafusion-nd-exec` | The nd plan nodes, the node registry, the `NdBoundaryRule`, the output terminals, the grid accumulator, axis ranges for readers, and a test harness (feature `test-utils`). It re-exports `nd-arrow-array` as `datafusion_nd_exec::array`. | `nd-arrow-array`, `datafusion` |
+| `datafusion-nd-exec` | The nd plan nodes, the node registry, the `NdBoundaryRule`, the output terminals, the regrid step, axis ranges for readers, and a test harness (feature `test-utils`). It re-exports `nd-arrow-array` as `datafusion_nd_exec::array`. | `nd-arrow-array`, `datafusion` |
 
 Both crates target DataFusion 53 and Arrow 58.
 
@@ -103,6 +103,7 @@ ProjectionExec [lat * 2]               NdBroadcastExec: region=[NdProjectionExec
 | `NdAxisReorderExec`, `NdEmptyExec` | none | Building blocks for sinks. |
 | `NdBroadcastExec` | the boundary | Makes flat rows. |
 | `NdDataSinkExec` | `DataSinkExec` | A terminal: writes the grid with an `NdDataSink`. |
+| `NdRegridExec` | none, the sink adds it | Collects all chunks with spill, builds the output grids, and gives each chunk its place. |
 | `NdEncodeExec` | the boundary at the root | A terminal: yields the encoded chunks for Arrow IPC or Flight. |
 
 ### The row count
@@ -197,7 +198,7 @@ Every chunk carries its own grid, so the files of one table can differ:
 |---|---|
 | Another size on an axis, for example `N_PROF` 3, 2 and 4 | Fine. Each chunk runs on its own grid. |
 | Other coordinate values, for example other days or other regions | Fine. |
-| Another set of axes, for example one file without `lon` | Fine for queries. A grid sink fails, see below. |
+| Another set of axes, for example one file without `lon` | Fine. A grid sink gets one output grid per axis set. |
 | A column that a file does not have | The column is null for the rows of that file. |
 
 Filters, projections, unions, limits, repartitions and coarsening all run per
@@ -205,10 +206,8 @@ chunk. Flat output is the rows of each chunk in sequence, like a `UNION ALL`
 of each file made flat on its own grid. The nd output (`NdEncodeExec`) keeps
 the grid of each chunk.
 
-Two things need the same grid in every file:
-
-- **Sort order:** a format must not call `with_ordered_chunks()` for a table whose files have another axis order.
-- **One output grid:** the grid sink places all chunks into one grid, with the rules below.
+A sort order needs the same grid in every file: a format must not call
+`with_ordered_chunks()` for a table whose files have another axis order.
 
 ## Write grids
 
@@ -221,6 +220,7 @@ Two things need the same grid in every file:
   pub trait NdDataSink: DisplayAs + Debug + Send + Sync {
       fn as_any(&self) -> &dyn Any;
       fn schema(&self) -> &SchemaRef;
+      fn requires_grid(&self) -> bool { false }
       async fn write_all(&self, data: SendableNdBatchStream, context: &Arc<TaskContext>) -> Result<u64>;
   }
   ```
@@ -241,122 +241,119 @@ Both terminals first compact each chunk with `NdRecordBatch::compact`:
 - A rectangle selection becomes a smaller dense grid.
 - A ragged or cell-mask selection keeps its grid, and each full-grid column gets null at the dropped cells.
 
-### The grid accumulator
+### The regrid step
 
-A grid writer does not keep the data. It places each chunk in one output grid
-with the `NdGridAccumulator`, writes the chunk at that place, and drops it.
-The accumulator keeps only the axis state.
+A grid writer, such as a Zarr or netCDF writer, needs the full output grid
+and the place of each chunk in it. A sink states this need with
+`requires_grid() == true`. `NdDataSinkExec` then reads its input through an
+`NdRegridExec`:
+
+```text
+NdDataSinkExec: sink=PrintingGridSink
+  NdRegridExec
+    NdFilterExec: predicate=[PRES@1 < 25]
+      ...
+```
+
+`NdRegridExec` has one output partition and runs in three phases:
+
+1. **Collect.** It reads all input partitions and compacts each chunk. It keeps a small record of each chunk: its axes, sizes and coordinate values. The chunks stay in a `MemoryReservation`. When the memory pool is full, the node spills the chunks to IPC files through the `SpillManager` of DataFusion.
+2. **Regrid.** After the last chunk, it builds the output grids and the place of each chunk from the records alone. It also checks for overlaps here.
+3. **Restream.** It reads the chunks back in collection order and gives each chunk its placement.
+
+A sink that does not require a grid gets no `NdRegridExec` and streams at once.
+
+### Read a placement
+
+Each chunk of a grid sink has `placement()`:
 
 ```rust
-let mut accumulator = NdGridAccumulator::new()
-    .with_mode("N_LEVELS", AxisMode::Pad);
-
 while let Some(chunk) = data.next().await {
-    let placement = accumulator.place(&chunk?)?;
-    for axis in &placement.axes {
-        // Grow the output axis to `axis.extent`.
-        // Write `axis.new_coordinates`, if any, at `axis.offset`.
+    let chunk = chunk?;
+    let placement = chunk.placement().expect("a grid sink gets placed chunks");
+    let grid = placement.grid();          // shared by all chunks of one grid
+    // On the first chunk of a grid: write `grid.dims()` and `grid.coordinates()`.
+    for (dim, positions) in grid.dims().iter().zip(placement.indices()) {
+        // `positions.value(i)` is the grid index of index `i` of the chunk on `dim`.
     }
-    // Write `placement.batch`, the compacted chunk, at the offsets.
+    // Write the chunk columns at those positions.
 }
 ```
 
-`place` returns one `AxisPlacement` per output axis:
+- `NdOutputGrid` holds the axes of the grid and the coordinate values of each axis. A writer takes the coordinates from the grid, not from the chunks.
+- `NdPlacement` holds one `UInt64Array` per grid axis. On a coordinate axis, the positions do not have to be contiguous.
+- The first chunk of each grid gives the grid, so a writer can write its metadata before the data.
+- An empty result gives no chunks, and the sink writes nothing.
 
-| Field | Meaning |
-|---|---|
-| `offset` | the first output index of the chunk on the axis |
-| `len` | the size of the chunk on the axis |
-| `extent` | the size of the output axis after this chunk |
-| `new_coordinates` | the coordinate values that the chunk adds at `offset`, or `None` |
+`NdGridBuilder` in `nd-arrow-array` holds the rules below. It uses Arrow only,
+so a host can use it without DataFusion.
 
-### The axis rules
+### The grid rules
 
-The first chunk sets the output axes and their order. Every chunk must have
-the same set of axes, or `place` fails.
+**Groups:** chunks with the same axis names in the same order make one group.
+Each group gets one output grid.
 
-One axis is the **growth axis**: the outer axis, or the axis of
-`with_growth_axis`. It is the axis along which files follow each other, such
-as `time` for daily files or `N_PROF` for profile files. The other axes are
-**inner axes**.
+**Axis with a coordinate:** the axis metadata names a coordinate column, and
+the query selects that column.
 
-| Mode | Axis | Default | Rule |
-|---|---|---|---|
-| `Coordinate` | growth or inner, with a coordinate column | yes | **Match:** values that are an exact contiguous slice of the output go at that slice. **Append:** values that do not overlap go at the end. **Conflict:** a partial overlap fails, and the error shows both value ranges. |
-| `Append` | growth only | on the growth axis without a coordinate | The chunk goes after all previous chunks. |
-| `Pad` | inner only, without a coordinate | no | Aligned at 0. The axis grows to the largest chunk, and the writer fills the rest. |
-| `Fixed` | inner only | on an inner axis without a coordinate | All chunks have the same size. |
+- The output values are the union of the values of all chunks, without duplicates.
+- The sort is ascending. It is descending only when every chunk with two or more values is strictly descending.
+- A null value, a value that repeats in one chunk, or a coordinate in some chunks only causes a failure.
 
-### Seeds: sort up front
+**Axis without a coordinate**, or with a coordinate column that the query does
+not select:
 
-Without a seed, appended coordinate values follow the arrival order of the
-chunks, and that order is not fixed when partitions merge.
-`coordinate_order(axis)` reports whether an axis came out ascending,
-descending or unordered.
+- The outer axis appends: each chunk gets the next range. The order is the input partition, then the chunk number in that partition, so it does not change between runs.
+- Each inner axis pads to the largest size, with each chunk at index 0.
 
-When the host knows a coordinate before it reads data, for example from file
-metadata, it gives the whole axis first:
+**Sparse grids:** each cell that no chunk writes is null. So chunks with
+other grids, for example two regions, fill one union grid.
 
-```rust
-let accumulator = NdGridAccumulator::new().with_coordinate("time", all_times);
-```
-
-- **Sorting:** the accumulator sorts the seed ascending, unless the seed is strictly descending, and removes duplicates.
-- **Order-free placement:** each chunk goes at the offset of its values, whatever the arrival order. The output axis is sorted.
-- **Known extent:** the writer knows the extent before the first chunk, so it can create fixed dimensions.
-- **Strict:** a seeded axis rejects a value outside the seed. On an inner axis, this rejects a file with another grid.
-
-A writer can take the seed back with `coordinate_seed(axis)`, and the name of
-the coordinate column with `coordinate_column(axis)`.
+**Overlap:** two chunks fail when they write the same cells. The error names
+both chunks and the cell ranges. Columns on fewer axes do not count, so two
+spatial tiles can write the same `time` values.
 
 ### Examples
 
-**Daily grid files** `time, lat, lon`, one day per file:
-
-```rust
-NdGridAccumulator::new()                               // time grows by coordinate,
-    .with_coordinate("time", all_days)                 // sorted whatever the order;
-    .with_coordinate("lat", lat).with_coordinate("lon", lon) // another grid fails.
-```
+**Daily grid files** `time, lat, lon`, one day per file, in any order: the
+output `time` axis holds all days in ascending order. `lat` and `lon` are the
+same in each file, so they stay the same.
 
 **Profile files** `N_PROF, N_LEVELS`, where both sizes change per file. This
 is the output of the example:
 
 ```text
-write chunk at N_PROF 0..3 of 3, N_LEVELS 0..2 of 2
-write chunk at N_PROF 3..5 of 5, N_LEVELS 0..3 of 3
-write chunk at N_PROF 5..9 of 9, N_LEVELS 0..2 of 3
-output grid: [("N_PROF", 9), ("N_LEVELS", 3)]
+output grid: N_PROF=9, N_LEVELS=3
+write chunk at N_PROF 0..=2, N_LEVELS 0..=1
+write chunk at N_PROF 3..=4, N_LEVELS 0..=2
+write chunk at N_PROF 5..=8, N_LEVELS 0..=1
 ```
 
-`N_PROF` grows by `Append`, and `N_LEVELS` pads to the largest file. The
-query kept only the first levels, so the compacted chunks have fewer levels
-than the files.
+`N_PROF` appends, and `N_LEVELS` pads to the largest chunk. The query keeps
+only the first levels, so most compacted chunks have fewer levels than their
+files. The second file has a profile with one level only, so its filter is not
+a rectangle, and its chunk keeps all 3 levels with nulls.
 
 **One file read in split chunks**, for example `lat 0..90` then `lat 90..180`:
-the second chunk appends to the unseeded `lat` axis, and together the chunks
+the union of the `lat` values gives the full axis, and together the chunks
 fill the grid.
 
-**Two resolutions**, for example `lat -15, 15` against `lat -30, 0, 30`:
-unseeded, the values do not overlap, so they append, and the output is a
-mostly empty union grid. Seed `lat` to make this fail, or resample first.
+**Two resolutions**, for example `lat -15, 15` against `lat -30, 0, 30`: the
+union gives `lat -30, -15, 0, 15, 30`, and the output is a mostly empty grid.
+Resample first to prevent this.
 
 ### Compared with xarray
 
-The accumulator behaves like xarray's combine functions, but it streams: it
-sees one chunk at a time and never goes back.
-
 | xarray | Here |
 |---|---|
-| `concat(dim=...)`, `combine_nested(concat_dim=...)` | The growth axis with `Append`. |
-| `combine_by_coords` (sorts by coordinate, then concatenates) | The growth axis with `Coordinate` and a seed. Without a seed, the order is the arrival order. |
-| `join="exact"` on the other dimensions | A seeded inner axis. |
-| `join="outer"` | An unseeded inner axis, for values that do not overlap. A partial overlap fails. |
-| Another length on a dimension without an index | `Fixed` fails in the same way. `Pad` gives the CF incomplete ragged layout. |
-| A repeated slice | An exact match goes to the same place, and the last chunk wins. |
+| `concat(dim=...)`, `combine_nested(concat_dim=...)` | The outer axis without a coordinate. |
+| `combine_by_coords` (sorts by coordinate, then concatenates) | An axis with a coordinate, in any arrival order. |
+| `join="outer"` on the other dimensions | The union of the coordinate values, with null cells. |
+| `compat="no_conflicts"` | An overlap fails, with no check of the values. |
+| Another length on a dimension without an index | The axis pads, which gives the CF incomplete ragged layout. |
 
 `testing::MemoryGridSink` is a complete in-memory writer on top of the
-accumulator. It is the reference for the tests and a model for a real writer.
+placements. It is the reference for the tests and a model for a real writer.
 A real writer must take the axes of each column from the chunk where the
 column has the most axes, because a file without the column gives it on no
 axis.
@@ -380,7 +377,8 @@ cargo run -p datafusion-nd-exec --example profiles
 
 ## Limits
 
-- The grid sink needs the same set of axes in every chunk. There is no grouping of chunks per grid yet.
+- A grid sink writes nothing until its input ends. Spilled chunks go to disk once and come back once. The input must be bounded.
+- `NdRegridExec` sends whole chunks, not blocks that match the storage chunks of the output.
 - The spatial box of `st_within` and `st_intersects` does not narrow axes yet.
 - `NdRepartitionExec` uses unbounded channels, so memory is not limited when a consumer is slow.
 - A filter adds a round-robin repartition, which loses the order, so `WHERE ... ORDER BY time` still sorts. The flat path does the same.
