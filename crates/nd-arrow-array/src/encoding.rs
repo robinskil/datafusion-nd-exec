@@ -77,7 +77,7 @@ pub fn nd_encoded_field_of(field: &Field) -> Field {
 
 /// Like [`nd_encoded_field_of`], but the extension metadata also records the
 /// axis names of `dims`. A format that knows the axes of each column at plan time uses
-/// this, so the plan can derive the grid and its sort order.
+/// this, so the plan can derive the grid of a scan.
 pub fn nd_encoded_field_with_dims(field: &Field, dims: &Dimensions) -> Field {
     let metadata = NdArrayMetadata::from_dims(dims);
     encoded_field(

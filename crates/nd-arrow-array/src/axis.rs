@@ -2,7 +2,8 @@
 //!
 //! A grid axis such as `time` has a coordinate column of the same name, and
 //! its values rise or fall. A format declares the grid axes of its scan with
-//! [`NdGridAxes`]. Plans use them to report a sort order and to write grids.
+//! [`NdGridAxes`]. A grid sink needs them, and the order of each axis gives
+//! its direction in the output grid.
 
 use arrow::array::{Array, BooleanArray};
 use arrow::compute::kernels::cmp::{gt_eq, lt_eq};

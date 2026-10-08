@@ -31,7 +31,6 @@ pub struct NdMemTable {
     partitions: Vec<Vec<NdRecordBatch>>,
     encoded: Vec<Vec<RecordBatch>>,
     grid_axes: Option<NdGridAxes>,
-    ordered_chunks: bool,
 }
 
 impl NdMemTable {
@@ -61,20 +60,12 @@ impl NdMemTable {
             partitions,
             encoded,
             grid_axes: None,
-            ordered_chunks: false,
         })
     }
 
     /// Declare the grid axes of the scan, see [`NdSourceExec::with_grid_axes`].
     pub fn with_grid_axes(mut self, axes: NdGridAxes) -> Self {
         self.grid_axes = Some(axes);
-        self
-    }
-
-    /// Declare that each partition holds its chunks in the order of the outer
-    /// axis, see [`NdSourceExec::with_ordered_chunks`].
-    pub fn with_ordered_chunks(mut self) -> Self {
-        self.ordered_chunks = true;
         self
     }
 
@@ -152,9 +143,6 @@ impl NdMemTable {
         let mut source = NdSourceExec::try_new(memory)?;
         if let Some(axes) = &self.grid_axes {
             source = source.with_grid_axes(axes.clone())?;
-        }
-        if self.ordered_chunks {
-            source = source.with_ordered_chunks()?;
         }
         let source = Arc::new(source);
         Ok(Arc::new(NdBroadcastExec::try_new(source, registry)?))

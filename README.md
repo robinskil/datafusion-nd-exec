@@ -115,7 +115,7 @@ ProjectionExec [lat * 2]               NdBroadcastExec: region=[NdProjectionExec
 
 | Node | Replaces | What it does |
 |---|---|---|
-| `NdSourceExec` | the scan of a format | Decodes encoded chunks. With `with_grid_axes(axes)`, it declares the grid axes of the scan, which a grid sink needs. With `with_ordered_chunks()`, it reports the order of the outer declared axes, so `ORDER BY time` needs no sort. |
+| `NdSourceExec` | the scan of a format | Decodes encoded chunks. With `with_grid_axes(axes)`, it declares the grid axes of the scan, which a grid sink needs. It reports no sort order, so `ORDER BY` sorts, as on the flat path. |
 | `NdFilterExec` | `FilterExec` | Evaluates each condition on the axes of its columns only. A condition on one axis gives a rectangle and runs first. The other conditions read their mask only at the cells that are still kept. A volatile condition stays above in a flat `FilterExec`. |
 | `NdProjectionExec` | `ProjectionExec` | Evaluates each element-wise expression on its own axes: `lat * 2` runs on the 3 values of `lat`, not on 24 cells. |
 | `NdLimitExec` | `LocalLimitExec`, `GlobalLimitExec` | Cuts the kept cells in stream order. A cut on outer-axis borders stays a rectangle. |
@@ -239,7 +239,6 @@ complete, runnable version is
 
    - Declare the grid axes only when every file of the table lies on these axes, in this order, and each axis has a coordinate variable with its name. A grid sink needs this declaration. A format of profiles or other data without coordinates declares no axes.
    - The order of each axis comes from the format, for example from the header or the coordinate values. `AxisOrder::detect` finds the order of a coordinate array.
-   - Call `NdSourceExec::with_ordered_chunks()` only when each partition yields its chunks split along the outer axis alone, in the order of that axis. The sort order then comes from the declared axes.
 
 4. **Prune chunks.** The file source gets the query filters as pruning hints.
    `axis_ranges(filters, schema, coordinates)` turns the conditions on one
@@ -314,9 +313,8 @@ chunk. Flat output is the rows of each chunk in sequence, like a `UNION ALL`
 of each file made flat on its own grid. The nd output (`NdEncodeExec`) keeps
 the grid of each chunk.
 
-A sort order and a grid sink need the same axes in every file: a format must
-not declare grid axes or ordered chunks for a table whose files have other
-axes.
+A grid sink needs the same axes in every file: a format must not declare grid
+axes for a table whose files have other axes.
 
 ## Write grids
 
@@ -551,10 +549,9 @@ cargo run -p datafusion-nd-exec --example profiles
 - `NdRegridExec` sends whole chunks, not blocks that match the storage chunks of the output. A Zarr sink must read, change and write a storage chunk again when a chunk covers only part of it.
 - A grid sink needs declared grid axes, with a coordinate column for each axis. Profile and ragged data cannot go to a grid sink.
 - Only the `NdGridCoordinatesRule` adds a coordinate column that the query lacks, and only to a `COPY TO` with a top projection. An `INSERT` and an `NdDataSinkExec` that a host plans itself get no columns.
-- With `with_ordered_chunks()`, DataFusion keeps the order of a `COPY` with a sort above the boundary. The write then does not use the nd sink. Do not declare ordered chunks for a table that a grid `COPY` reads.
 - The spatial box of `st_within` and `st_intersects` does not narrow axes yet.
 - `NdRepartitionExec` uses unbounded channels, so memory is not limited when a consumer is slow.
-- A filter adds a round-robin repartition, which loses the order, so `WHERE ... ORDER BY time` still sorts. The flat path does the same.
+- The nd scan reports no sort order, so `ORDER BY` always sorts the flat rows, as on the flat path. With an order, DataFusion would add sorts above the boundary, also for a `COPY`.
 - `NdCoarsenExec` computes `Min` and `Max` in `Float64`, so an integer above 2^53 can lose precision. Its blocks do not cross chunks.
 
 The design documents are in [docs/superpowers/specs](docs/superpowers/specs).

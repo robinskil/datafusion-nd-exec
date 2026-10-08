@@ -13,7 +13,7 @@ use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::filter::{FilterExec, FilterExecBuilder};
 use datafusion::physical_plan::projection::{ProjectionExec, ProjectionExpr};
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, collect, displayable};
-use datafusion_nd_exec::testing::{Differential, grid_table, profile_table, sorted_rows};
+use datafusion_nd_exec::testing::{Differential, grid_table, sorted_rows};
 use datafusion_nd_exec::{NdBoundaryRule, NdNodeRegistry};
 
 fn harness() -> Result<Differential> {
@@ -122,42 +122,6 @@ async fn a_union_of_nd_scans_runs_below_the_broadcast() -> Result<()> {
         "no UnionExec may stay above the broadcast:
 {plan}"
     );
-    Ok(())
-}
-
-/// Whether the nd plan of `sql` sorts.
-async fn sorts(harness: &Differential, sql: &str) -> Result<bool> {
-    let plan = harness.nd_plan(sql).await?;
-    Ok(plan.lines().any(|l| l.trim_start().starts_with("SortExec")))
-}
-
-#[tokio::test]
-async fn an_order_on_the_outer_coordinates_needs_no_sort() -> Result<()> {
-    let harness = harness()?;
-    harness.register("profiles", profile_table()?)?;
-    for sql in [
-        "SELECT time, sst FROM grid ORDER BY time",
-        "SELECT time, lat, lon, sst FROM grid ORDER BY time, lat, lon",
-    ] {
-        assert!(
-            !sorts(&harness, sql).await?,
-            "{sql}\n{}",
-            harness.nd_plan(sql).await?
-        );
-    }
-    for sql in [
-        // `lat` is not the outer axis.
-        "SELECT lat, sst FROM grid ORDER BY lat",
-        "SELECT time, sst FROM grid ORDER BY time DESC",
-        // A profile axis has no order.
-        r#"SELECT "PRES" FROM profiles ORDER BY "PRES""#,
-    ] {
-        assert!(
-            sorts(&harness, sql).await?,
-            "{sql}\n{}",
-            harness.nd_plan(sql).await?
-        );
-    }
     Ok(())
 }
 
@@ -417,26 +381,5 @@ async fn a_union_with_other_axes_has_no_grid_axes() -> Result<()> {
         registry,
     )?;
     assert!(datafusion_nd_exec::exec::NdExecutionPlan::grid_axes(&mixed).is_none());
-    Ok(())
-}
-
-#[tokio::test]
-async fn the_sort_order_stops_at_an_unordered_axis() -> Result<()> {
-    use datafusion_nd_exec::array::{AxisOrder, NdGridAxes};
-    use datafusion_nd_exec::testing::NdMemTable;
-
-    let axes = NdGridAxes::new([
-        ("time", AxisOrder::Descending),
-        ("lat", AxisOrder::Unordered),
-        ("lon", AxisOrder::Ascending),
-    ]);
-    let table = NdMemTable::try_new(grid_table()?.partitions().to_vec())?
-        .with_grid_axes(axes)
-        .with_ordered_chunks();
-    let scan = table.nd_scan(None, NdNodeRegistry::shared_default())?;
-    let source = scan.children()[0].clone();
-    let ordering = source.output_ordering().expect("an order on time");
-    assert_eq!(ordering.len(), 1);
-    assert_eq!(ordering[0].to_string(), "time@0 DESC");
     Ok(())
 }

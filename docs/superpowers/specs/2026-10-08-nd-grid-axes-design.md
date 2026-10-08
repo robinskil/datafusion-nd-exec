@@ -54,12 +54,14 @@ the coordinate values of the file.
 - `NdFilterExec`, `NdProjectionExec`, `NdLimitExec`, `NdRepartitionExec`, `NdCoalescePartitionsExec`, `NdCoarsenExec` and `NdRegridExec` return the axes of their child.
 - `NdUnionExec` returns them when all inputs declare equal axes, else `None`.
 
-## 4. The sort order
+## 4. No sort order
 
-`NdSourceExec::with_ordered_chunks()` reports the order of the outer declared
-axes. The order stops at the first axis that is `Unordered`, or whose
-coordinate column is not in the schema. Without declared axes, it reports no
-order.
+`NdSourceExec::with_ordered_chunks()` and the sort report go away. No output
+needs the order: a grid sink places chunks by coordinate values, and flat
+output has no order. A reported order made DataFusion add a `SortExec` and a
+`SortPreservingMergeExec` above the boundary, also for a `COPY`, so a grid
+sink did not sink. The declared order of an axis only gives its direction in
+the output grid.
 
 ## 5. The grid sink
 
@@ -100,14 +102,13 @@ They do not change otherwise.
 - Builder: a batch with an undeclared axis, with the axes in another order, without a coordinate column, or with other axes than the first batch fails at `add`; the declared order gives the sort.
 - Plan: a grid sink over a scan without declared axes fails at plan time; a streaming sink does not.
 - Propagation: the declared axes pass through a filter, a projection, a repartition, a coalesce and a union.
-- Sort order: `with_ordered_chunks` reports the declared order, and stops at an `Unordered` axis.
 - End to end: `grid_table` declares `time, lat, lon` and writes its grid; the profile table cannot go to a grid sink.
 
 ## Steps
 
 1. Remove the axis metadata in `nd-arrow-array`, and add `NdGridAxes`.
 2. Change `NdGridBuilder` to the declared axes.
-3. `grid_axes` on the nodes, `with_grid_axes`, the sort order, and the plan-time check.
+3. `grid_axes` on the nodes, `with_grid_axes`, the removal of the sort order, and the plan-time check.
 4. The regrid step, the test sink, the corpus, the tests and the example.
 5. README.
 

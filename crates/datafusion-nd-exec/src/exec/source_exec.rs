@@ -4,13 +4,10 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use arrow::compute::SortOptions;
-use arrow::datatypes::Schema;
 use datafusion::common::config::ConfigOptions;
 use datafusion::error::Result;
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr, PhysicalSortExpr};
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::filter_pushdown::{
     ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
 };
@@ -22,7 +19,7 @@ use datafusion::physical_plan::{
 };
 use futures::{StreamExt, TryStreamExt};
 use nd_arrow_array::encoding::{decode_nd_record_batch_row, logical_schema, nd_batch_count};
-use nd_arrow_array::{AxisOrder, NdGridAxes, SelectionKind};
+use nd_arrow_array::{NdGridAxes, SelectionKind};
 
 use super::{NdBroadcastExec, NdExecutionPlan, SendableNdBatchStream, one_child};
 use crate::registry::NdNodeRegistry;
@@ -39,8 +36,6 @@ pub struct NdSourceExec {
     input: Arc<dyn ExecutionPlan>,
     /// The grid axes that the format declares, if any.
     grid_axes: Option<Arc<NdGridAxes>>,
-    /// True when each partition yields its chunks in the order of the outer axis.
-    ordered_chunks: bool,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -48,43 +43,20 @@ pub struct NdSourceExec {
 impl NdSourceExec {
     /// Wrap a child plan whose output columns are `nd.array`-encoded structs.
     pub fn try_new(input: Arc<dyn ExecutionPlan>) -> Result<Self> {
-        Self::build(input, None, false)
+        Self::build(input, None)
     }
 
     /// Declare the grid axes of the scan. Each chunk then lies on these axes,
     /// in this order, and each axis has a coordinate column with its name. A
     /// grid sink needs this declaration.
     pub fn with_grid_axes(self, axes: NdGridAxes) -> Result<Self> {
-        Self::build(self.input, Some(Arc::new(axes)), self.ordered_chunks)
+        Self::build(self.input, Some(Arc::new(axes)))
     }
 
-    /// Report the sort order of the grid.
-    ///
-    /// A format calls this when each partition yields its chunks split only
-    /// along the outer axis, in the order of that axis, and every chunk holds
-    /// every column. The node then reports a lexicographic order over the
-    /// outer declared grid axes, see [`with_grid_axes`](Self::with_grid_axes).
-    /// The order stops at the first `Unordered` axis, or at an axis whose
-    /// coordinate column is not in the schema.
-    pub fn with_ordered_chunks(self) -> Result<Self> {
-        Self::build(self.input, self.grid_axes, true)
-    }
-
-    fn build(
-        input: Arc<dyn ExecutionPlan>,
-        grid_axes: Option<Arc<NdGridAxes>>,
-        ordered_chunks: bool,
-    ) -> Result<Self> {
-        let logical_schema = logical_schema(&input.schema())?;
-        let ordering = match (&grid_axes, ordered_chunks) {
-            (Some(axes), true) => axis_ordering(axes, &logical_schema),
-            _ => vec![],
-        };
-        let eq_properties = if ordering.is_empty() {
-            EquivalenceProperties::new(logical_schema)
-        } else {
-            EquivalenceProperties::new_with_orderings(logical_schema, [ordering])
-        };
+    fn build(input: Arc<dyn ExecutionPlan>, grid_axes: Option<Arc<NdGridAxes>>) -> Result<Self> {
+        // The node reports no order: no output needs one, and an order makes
+        // DataFusion add sorts above the boundary.
+        let eq_properties = EquivalenceProperties::new(logical_schema(&input.schema())?);
         // Same partitioning/emission/boundedness as the child; only the schema
         // changes (encoded structs → logical value types).
         let properties = Arc::new(
@@ -97,7 +69,6 @@ impl NdSourceExec {
         Ok(Self {
             input,
             grid_axes,
-            ordered_chunks,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -106,29 +77,6 @@ impl NdSourceExec {
     pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
         &self.input
     }
-}
-
-/// The lexicographic order of the outer declared axes whose coordinate column
-/// is in `logical`.
-fn axis_ordering(axes: &NdGridAxes, logical: &Schema) -> Vec<PhysicalSortExpr> {
-    let mut ordering = Vec::new();
-    for (axis, order) in axes.axes() {
-        let descending = match order {
-            AxisOrder::Ascending => false,
-            AxisOrder::Descending => true,
-            AxisOrder::Unordered => break,
-        };
-        let Ok(index) = logical.index_of(axis) else {
-            break;
-        };
-        // No coordinate value is null. The null placement is the SQL default,
-        // so a plain `ORDER BY` matches.
-        ordering.push(PhysicalSortExpr::new(
-            Arc::new(Column::new(axis, index)),
-            SortOptions::new(descending, descending),
-        ));
-    }
-    ordering
 }
 
 impl DisplayAs for NdSourceExec {
@@ -165,11 +113,7 @@ impl ExecutionPlan for NdSourceExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let input = one_child("NdSourceExec", children)?;
-        Ok(Arc::new(Self::build(
-            input,
-            self.grid_axes.clone(),
-            self.ordered_chunks,
-        )?))
+        Ok(Arc::new(Self::build(input, self.grid_axes.clone())?))
     }
 
     fn execute(

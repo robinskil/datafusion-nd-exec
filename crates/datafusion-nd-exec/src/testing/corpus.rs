@@ -82,9 +82,7 @@ pub fn grid_table() -> Result<NdMemTable> {
         ("lat", AxisOrder::Ascending),
         ("lon", AxisOrder::Ascending),
     ]);
-    Ok(NdMemTable::try_new(partitions)?
-        .with_grid_axes(axes)
-        .with_ordered_chunks())
+    Ok(NdMemTable::try_new(partitions)?.with_grid_axes(axes))
 }
 
 /// The schema of [`profile_table`].

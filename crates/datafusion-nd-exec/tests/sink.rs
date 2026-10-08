@@ -370,10 +370,7 @@ async fn a_grid_copy_gets_its_coordinates() -> Result<()> {
     use datafusion::execution::SessionStateBuilder;
     use datafusion::prelude::SessionContext;
 
-    // With ordered chunks, DataFusion keeps the order of a COPY with a sort
-    // above the boundary, and the write stays flat. This table has no order.
-    let table =
-        NdMemTable::try_new(grid_table()?.partitions().to_vec())?.with_grid_axes(grid_axes());
+    let table = grid_table()?;
     // The sink gets the schema with the coordinates that the rule adds.
     let schema = Arc::new(arrow::datatypes::Schema::new(vec![
         table.schema().field_with_name("sst")?.clone(),
