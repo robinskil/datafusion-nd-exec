@@ -4,8 +4,8 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use arrow::array::{Array, AsArray};
-use arrow::datatypes::{Int32Type, SchemaRef};
+use arrow::array::AsArray;
+use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::common::config::ConfigOptions;
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
@@ -16,7 +16,7 @@ use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream, collect, displayable,
 };
-use datafusion_nd_exec::array::{Dimension, Dimensions, NdArrowArray, NdRecordBatch};
+use datafusion_nd_exec::array::{AxisOrder, NdGridAxes, NdRecordBatch};
 use datafusion_nd_exec::exec::NdBroadcastExec;
 use datafusion_nd_exec::sink::{NdDataSink, NdDataSinkExec, NdSinkFactory};
 use datafusion_nd_exec::testing::{
@@ -75,30 +75,32 @@ async fn a_grid_round_trips_through_the_sink() -> Result<()> {
 }
 
 #[tokio::test]
-async fn profiles_append_and_pad_in_the_sink() -> Result<()> {
+async fn a_profile_table_cannot_go_to_a_grid_sink() -> Result<()> {
     let table = profile_table()?;
     let schema = table
         .nd_scan(None, NdNodeRegistry::shared_default())?
         .schema();
-    let sink = Arc::new(MemoryGridSink::new(schema));
-    let rows = run(Arc::new(NdDataSinkExec::try_new(
+    // The profile axes have no coordinates, so the scan declares no grid axes.
+    let error = NdDataSinkExec::try_new(
         nd_scan(&table)?,
-        sink.clone(),
+        Arc::new(MemoryGridSink::new(schema)),
         NdNodeRegistry::shared_default(),
-    )?))
-    .await?;
-    // 3 x 4 cells from the first file and 2 x 3 from the second.
-    assert_eq!(rows, 18);
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("grid axes"), "{error}");
 
-    let grid = sink.grid().unwrap();
-    let names: Vec<(&str, usize)> = grid.target().iter().map(|d| (d.name(), d.size())).collect();
-    assert_eq!(names, [("N_PROF", 5), ("N_LEVELS", 4)]);
-    let platforms = grid.column(0).values().as_primitive::<Int32Type>();
-    assert_eq!(platforms.values(), &[1901, 1901, 1902, 1903, 1904]);
-    // The pad cells of the second file, level 3 of profiles 3 and 4, are null.
-    let pres = grid.column(2).values();
-    assert!(pres.is_null(3 * 4 + 3) && pres.is_null(4 * 4 + 3));
-    assert!(pres.is_valid(3 * 4));
+    // A sink without a grid streams the profiles.
+    let counting = Arc::new(NdDataSinkExec::try_new(
+        nd_scan(&table)?,
+        Arc::new(CountingSink {
+            schema: table
+                .nd_scan(None, NdNodeRegistry::shared_default())?
+                .schema(),
+        }),
+        NdNodeRegistry::shared_default(),
+    )?);
+    // 3 x 4 cells from the first file and 2 x 3 from the second.
+    assert_eq!(run(counting).await?, 18);
     Ok(())
 }
 
@@ -110,7 +112,8 @@ async fn chunks_in_reverse_order_come_out_sorted() -> Result<()> {
     let schema = table
         .nd_scan(None, NdNodeRegistry::shared_default())?
         .schema();
-    let reversed = NdMemTable::try_new(table.partitions().iter().rev().cloned().collect())?;
+    let reversed = NdMemTable::try_new(table.partitions().iter().rev().cloned().collect())?
+        .with_grid_axes(grid_axes());
 
     let in_order = Arc::new(MemoryGridSink::new(schema.clone()));
     run(Arc::new(NdDataSinkExec::try_new(
@@ -292,43 +295,19 @@ async fn without_a_factory_the_flat_sink_stays() -> Result<()> {
     Ok(())
 }
 
-/// `grid_table` without axis metadata: the reader declares nothing.
-fn undeclared_grid_table() -> Result<NdMemTable> {
-    let strip = |dims: &Dimensions| {
-        Dimensions::try_new(
-            dims.iter()
-                .map(|d| Dimension::new(d.name(), d.size()))
-                .collect(),
-        )
-    };
-    let partitions = grid_table()?
-        .partitions()
-        .iter()
-        .map(|batches| {
-            batches
-                .iter()
-                .map(|batch| {
-                    let columns = batch
-                        .columns()
-                        .iter()
-                        .map(|c| Ok(NdArrowArray::try_new(c.values().clone(), strip(c.dims())?)?))
-                        .collect::<Result<Vec<_>>>()?;
-                    Ok(NdRecordBatch::try_new(
-                        batch.schema().clone(),
-                        columns,
-                        strip(batch.target())?,
-                    )?)
-                })
-                .collect::<Result<Vec<_>>>()
-        })
-        .collect::<Result<Vec<_>>>()?;
-    NdMemTable::try_new(partitions)
+/// The grid axes of `grid_table`.
+fn grid_axes() -> NdGridAxes {
+    NdGridAxes::new([
+        ("time", AxisOrder::Ascending),
+        ("lat", AxisOrder::Ascending),
+        ("lon", AxisOrder::Ascending),
+    ])
 }
 
-/// Write the result of `sql` on `undeclared_grid_table` to a `MemoryGridSink`.
-async fn write_undeclared(sql: &str) -> Result<NdRecordBatch> {
+/// Write the result of `sql` on `grid_table` to a `MemoryGridSink`.
+async fn write_grid(sql: &str) -> Result<NdRecordBatch> {
     let harness = Differential::new();
-    harness.register("t", undeclared_grid_table()?)?;
+    harness.register("t", grid_table()?)?;
     let ctx = harness.nd_context();
     let plan = ctx.sql(sql).await?.create_physical_plan().await?;
     let boundary = plan
@@ -346,10 +325,10 @@ async fn write_undeclared(sql: &str) -> Result<NdRecordBatch> {
 }
 
 #[tokio::test]
-async fn coordinates_need_no_declaration() -> Result<()> {
+async fn coordinates_come_from_the_column_names() -> Result<()> {
     use arrow::datatypes::Float64Type;
 
-    let grid = write_undeclared("SELECT time, lat, lon, sst FROM t WHERE lat > 0").await?;
+    let grid = write_grid("SELECT time, lat, lon, sst FROM t WHERE lat > 0").await?;
     let shape: Vec<(&str, usize)> = grid.target().iter().map(|d| (d.name(), d.size())).collect();
     assert_eq!(shape, [("time", 4), ("lat", 1), ("lon", 2)]);
     let lat = grid.column(1).values().as_primitive::<Float64Type>();
@@ -358,19 +337,15 @@ async fn coordinates_need_no_declaration() -> Result<()> {
 }
 
 #[tokio::test]
-async fn a_cut_axis_without_its_coordinate_keeps_its_index() -> Result<()> {
-    use arrow::datatypes::Float64Type;
-
-    // No `lon` column: the first chunk keeps one cell, at lon index 1.
-    let grid = write_undeclared("SELECT time, lat, sst FROM t WHERE lat > 0 AND sst > 5").await?;
-    let shape: Vec<(&str, usize)> = grid.target().iter().map(|d| (d.name(), d.size())).collect();
-    assert_eq!(shape, [("time", 3), ("lat", 3), ("lon", 2)]);
-    let sst = grid.column(2).values().as_primitive::<Float64Type>();
-    // time 101, lat 30, lon index 1.
-    let cell = 2 * 2 + 1;
-    assert!(sst.is_valid(cell) && sst.value(cell) == 5.5, "{sst:?}");
-    assert!(sst.is_null(cell - 1));
-    Ok(())
+async fn a_grid_axis_without_its_coordinate_fails() {
+    // The query does not select `lon`, so the chunks hold no `lon` coordinate.
+    let error = write_grid("SELECT time, lat, sst FROM t WHERE lat > 0 AND sst > 5")
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("select the column 'lon'"),
+        "{error}"
+    );
 }
 
 /// The host maps the CSV sink of `COPY TO` to an in-memory grid sink.
@@ -395,7 +370,10 @@ async fn a_grid_copy_gets_its_coordinates() -> Result<()> {
     use datafusion::execution::SessionStateBuilder;
     use datafusion::prelude::SessionContext;
 
-    let table = undeclared_grid_table()?;
+    // With ordered chunks, DataFusion keeps the order of a COPY with a sort
+    // above the boundary, and the write stays flat. This table has no order.
+    let table =
+        NdMemTable::try_new(grid_table()?.partitions().to_vec())?.with_grid_axes(grid_axes());
     // The sink gets the schema with the coordinates that the rule adds.
     let schema = Arc::new(arrow::datatypes::Schema::new(vec![
         table.schema().field_with_name("sst")?.clone(),

@@ -18,7 +18,7 @@ pub mod grid;
 pub mod selection;
 
 pub use array::NdArrowArray;
-pub use axis::{AxisMeta, AxisOrder};
+pub use axis::{AxisOrder, NdGridAxes};
 pub use batch::NdRecordBatch;
 pub use broadcast::BroadcastMap;
 pub use dimensions::{Dimension, Dimensions};

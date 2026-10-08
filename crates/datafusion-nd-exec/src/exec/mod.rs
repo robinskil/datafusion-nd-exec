@@ -33,7 +33,7 @@ use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
-use nd_arrow_array::{NdRecordBatch, SelectionKind};
+use nd_arrow_array::{NdGridAxes, NdRecordBatch, SelectionKind};
 
 use crate::registry::NdNodeRegistry;
 
@@ -101,6 +101,13 @@ pub trait NdExecutionPlan: ExecutionPlan {
     /// The finest [`SelectionKind`] that this node can output.
     fn max_output_selection(&self) -> SelectionKind {
         SelectionKind::CellMask
+    }
+
+    /// The grid axes that the scan below declares, see
+    /// [`NdSourceExec::with_grid_axes`]. A node that keeps the axes of its
+    /// input returns the axes of its nd child.
+    fn grid_axes(&self) -> Option<Arc<NdGridAxes>> {
+        None
     }
 }
 

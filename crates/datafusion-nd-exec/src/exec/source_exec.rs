@@ -21,10 +21,8 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use futures::{StreamExt, TryStreamExt};
-use nd_arrow_array::encoding::{
-    decode_nd_record_batch_row, logical_schema, nd_batch_count, nd_field_metadata, plan_target_axes,
-};
-use nd_arrow_array::{AxisOrder, NdArrayMetadata, SelectionKind};
+use nd_arrow_array::encoding::{decode_nd_record_batch_row, logical_schema, nd_batch_count};
+use nd_arrow_array::{AxisOrder, NdGridAxes, SelectionKind};
 
 use super::{NdBroadcastExec, NdExecutionPlan, SendableNdBatchStream, one_child};
 use crate::registry::NdNodeRegistry;
@@ -39,6 +37,8 @@ use crate::registry::NdNodeRegistry;
 pub struct NdSourceExec {
     /// Child plan producing nd-encoded `RecordBatch`es.
     input: Arc<dyn ExecutionPlan>,
+    /// The grid axes that the format declares, if any.
+    grid_axes: Option<Arc<NdGridAxes>>,
     /// True when each partition yields its chunks in the order of the outer axis.
     ordered_chunks: bool,
     properties: Arc<PlanProperties>,
@@ -48,7 +48,14 @@ pub struct NdSourceExec {
 impl NdSourceExec {
     /// Wrap a child plan whose output columns are `nd.array`-encoded structs.
     pub fn try_new(input: Arc<dyn ExecutionPlan>) -> Result<Self> {
-        Self::build(input, false)
+        Self::build(input, None, false)
+    }
+
+    /// Declare the grid axes of the scan. Each chunk then lies on these axes,
+    /// in this order, and each axis has a coordinate column with its name. A
+    /// grid sink needs this declaration.
+    pub fn with_grid_axes(self, axes: NdGridAxes) -> Result<Self> {
+        Self::build(self.input, Some(Arc::new(axes)), self.ordered_chunks)
     }
 
     /// Report the sort order of the grid.
@@ -56,22 +63,22 @@ impl NdSourceExec {
     /// A format calls this when each partition yields its chunks split only
     /// along the outer axis, in the order of that axis, and every chunk holds
     /// every column. The node then reports a lexicographic order over the
-    /// outer axes of the plan-time grid. The order stops at the first axis
-    /// without a monotone coordinate, or with a coordinate column that is not
-    /// in the schema. The encoded fields must record their axes, see
-    /// [`nd_encoded_field_with_dims`].
-    ///
-    /// [`nd_encoded_field_with_dims`]: nd_arrow_array::encoding::nd_encoded_field_with_dims
+    /// outer declared grid axes, see [`with_grid_axes`](Self::with_grid_axes).
+    /// The order stops at the first `Unordered` axis, or at an axis whose
+    /// coordinate column is not in the schema.
     pub fn with_ordered_chunks(self) -> Result<Self> {
-        Self::build(self.input, true)
+        Self::build(self.input, self.grid_axes, true)
     }
 
-    fn build(input: Arc<dyn ExecutionPlan>, ordered_chunks: bool) -> Result<Self> {
+    fn build(
+        input: Arc<dyn ExecutionPlan>,
+        grid_axes: Option<Arc<NdGridAxes>>,
+        ordered_chunks: bool,
+    ) -> Result<Self> {
         let logical_schema = logical_schema(&input.schema())?;
-        let ordering = if ordered_chunks {
-            axis_ordering(&input.schema(), &logical_schema)
-        } else {
-            vec![]
+        let ordering = match (&grid_axes, ordered_chunks) {
+            (Some(axes), true) => axis_ordering(axes, &logical_schema),
+            _ => vec![],
         };
         let eq_properties = if ordering.is_empty() {
             EquivalenceProperties::new(logical_schema)
@@ -89,6 +96,7 @@ impl NdSourceExec {
         );
         Ok(Self {
             input,
+            grid_axes,
             ordered_chunks,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -100,37 +108,23 @@ impl NdSourceExec {
     }
 }
 
-/// The lexicographic order of the outer axes of the plan-time grid that have
-/// a monotone coordinate column in `logical`.
-fn axis_ordering(encoded: &Schema, logical: &Schema) -> Vec<PhysicalSortExpr> {
-    let Some(axes) = plan_target_axes(encoded) else {
-        return vec![];
-    };
-    let metadata: Vec<NdArrayMetadata> = encoded
-        .fields()
-        .iter()
-        .filter_map(|field| nd_field_metadata(field))
-        .collect();
+/// The lexicographic order of the outer declared axes whose coordinate column
+/// is in `logical`.
+fn axis_ordering(axes: &NdGridAxes, logical: &Schema) -> Vec<PhysicalSortExpr> {
     let mut ordering = Vec::new();
-    for axis in &axes {
-        let Some(meta) = metadata.iter().find_map(|m| m.axis_meta(axis)) else {
-            break;
-        };
-        let descending = match meta.order() {
+    for (axis, order) in axes.axes() {
+        let descending = match order {
             AxisOrder::Ascending => false,
             AxisOrder::Descending => true,
             AxisOrder::Unordered => break,
         };
-        let Some((index, column)) = meta
-            .coordinate_column()
-            .and_then(|name| logical.index_of(name).ok().map(|i| (i, name)))
-        else {
+        let Ok(index) = logical.index_of(axis) else {
             break;
         };
         // No coordinate value is null. The null placement is the SQL default,
         // so a plain `ORDER BY` matches.
         ordering.push(PhysicalSortExpr::new(
-            Arc::new(Column::new(column, index)),
+            Arc::new(Column::new(axis, index)),
             SortOptions::new(descending, descending),
         ));
     }
@@ -139,7 +133,13 @@ fn axis_ordering(encoded: &Schema, logical: &Schema) -> Vec<PhysicalSortExpr> {
 
 impl DisplayAs for NdSourceExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "NdSourceExec")
+        match &self.grid_axes {
+            Some(axes) => {
+                let names: Vec<&str> = axes.axes().iter().map(|(name, _)| name.as_str()).collect();
+                write!(f, "NdSourceExec: grid_axes=[{}]", names.join(", "))
+            }
+            None => write!(f, "NdSourceExec"),
+        }
     }
 }
 
@@ -165,7 +165,11 @@ impl ExecutionPlan for NdSourceExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let input = one_child("NdSourceExec", children)?;
-        Ok(Arc::new(Self::build(input, self.ordered_chunks)?))
+        Ok(Arc::new(Self::build(
+            input,
+            self.grid_axes.clone(),
+            self.ordered_chunks,
+        )?))
     }
 
     fn execute(
@@ -206,6 +210,10 @@ impl ExecutionPlan for NdSourceExec {
 }
 
 impl NdExecutionPlan for NdSourceExec {
+    fn grid_axes(&self) -> Option<Arc<NdGridAxes>> {
+        self.grid_axes.clone()
+    }
+
     /// A decoded batch keeps every cell.
     fn max_output_selection(&self) -> SelectionKind {
         SelectionKind::Full

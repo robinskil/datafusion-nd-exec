@@ -25,10 +25,9 @@ use futures::{StreamExt, TryStreamExt};
 use nd_arrow_array::encoding::{
     decode_nd_record_batch_row, encode_nd_record_batch_as, encoded_schema, nd_batch_count,
 };
-use nd_arrow_array::grid::axis_origins;
 use nd_arrow_array::{
-    Dimensions, NdArrowArray, NdBatchRecord, NdGridBuilder, NdOutputGrid, NdPlacement,
-    NdRecordBatch, SelectionKind,
+    Dimensions, NdBatchRecord, NdGridAxes, NdGridBuilder, NdOutputGrid, NdPlacement, NdRecordBatch,
+    SelectionKind,
 };
 
 use crate::exec::{
@@ -46,14 +45,22 @@ pub struct NdRegridExec {
     input: Arc<dyn ExecutionPlan>,
     nd_input: Arc<dyn NdExecutionPlan>,
     registry: Arc<NdNodeRegistry>,
+    /// The grid axes that the scan declares.
+    axes: Arc<NdGridAxes>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
 impl NdRegridExec {
-    /// The nd child is resolved through `registry`.
+    /// The nd child is resolved through `registry`. The scan below must
+    /// declare its grid axes, else this fails with a plan error.
     pub fn try_new(input: Arc<dyn ExecutionPlan>, registry: Arc<NdNodeRegistry>) -> Result<Self> {
         let nd_input = require_nd_input("NdRegridExec", &input, &registry)?;
+        let axes = nd_input.grid_axes().ok_or_else(|| {
+            DataFusionError::Plan(
+                "a grid sink needs a scan with grid axes: the format must declare them with NdSourceExec::with_grid_axes".to_string(),
+            )
+        })?;
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(input.schema()),
             Partitioning::UnknownPartitioning(1),
@@ -64,6 +71,7 @@ impl NdRegridExec {
             input,
             nd_input,
             registry,
+            axes,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -92,6 +100,7 @@ impl Collector {
     fn new(
         schema: SchemaRef,
         partitions: usize,
+        axes: Arc<NdGridAxes>,
         metrics: &ExecutionPlanMetricsSet,
         context: &TaskContext,
     ) -> Self {
@@ -107,7 +116,7 @@ impl Collector {
         Self {
             schema,
             spill_schema,
-            builder: NdGridBuilder::new(),
+            builder: NdGridBuilder::new(axes),
             targets: Vec::new(),
             held: Vec::new(),
             held_bytes: 0,
@@ -121,15 +130,14 @@ impl Collector {
     fn push(&mut self, partition: usize, batch: NdRecordBatch) -> Result<()> {
         let number = self.next[partition];
         self.next[partition] += 1;
-        let origins = axis_origins(batch.selection(), batch.target().rank());
         let batch = batch.compact()?;
         if batch.target().num_elements() == 0 {
             return Ok(());
         }
-        let record = NdBatchRecord::of(partition, number, &batch).with_origins(origins)?;
+        let record = NdBatchRecord::of(partition, number, &batch)?;
         // The records stay in memory until the regrid, whatever the pool says.
         self.reservation.grow(record.memory_size());
-        let id = self.builder.add(record);
+        let id = self.builder.add(record)?;
         self.targets.push(batch.target().clone());
 
         let size: usize = batch
@@ -165,7 +173,7 @@ impl Collector {
         Ok(())
     }
 
-    /// The encoded batch on the spill schema. The record keeps the axis metadata.
+    /// The encoded batch on the spill schema. The record keeps the grid of the batch.
     fn encode(&self, batch: &NdRecordBatch) -> Result<RecordBatch> {
         Ok(encode_nd_record_batch_as(batch, &self.spill_schema)?)
     }
@@ -266,20 +274,10 @@ impl Place {
         Ok(batch.with_placement(self.placements[id].clone())?)
     }
 
-    /// Rebuild a batch from a spill file on its own grid, with its axis metadata.
+    /// Rebuild a batch from a spill file on its own grid and schema.
     fn restore(&self, id: usize, decoded: NdRecordBatch) -> Result<NdRecordBatch> {
-        let target = &self.targets[id];
-        let meta = |name: &str| {
-            target
-                .position(name)
-                .and_then(|axis| target.get(axis).meta().cloned())
-        };
-        let columns = decoded
-            .columns()
-            .iter()
-            .map(|c| NdArrowArray::try_new(c.values().clone(), c.dims().with_axis_meta(meta)))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let batch = NdRecordBatch::try_new(self.schema.clone(), columns, target.clone())?;
+        let columns = decoded.columns().to_vec();
+        let batch = NdRecordBatch::try_new(self.schema.clone(), columns, self.targets[id].clone())?;
         self.attach(id, batch)
     }
 }
@@ -334,6 +332,10 @@ impl ExecutionPlan for NdRegridExec {
 }
 
 impl NdExecutionPlan for NdRegridExec {
+    fn grid_axes(&self) -> Option<Arc<NdGridAxes>> {
+        self.nd_input.grid_axes()
+    }
+
     fn execute_nd(
         &self,
         partition: usize,
@@ -351,7 +353,13 @@ impl NdExecutionPlan for NdRegridExec {
                 Ok(stream.map_ok(move |batch| (p, batch)).boxed())
             })
             .collect::<Result<Vec<_>>>()?;
-        let mut collector = Collector::new(self.schema(), partitions, &self.metrics, &context);
+        let mut collector = Collector::new(
+            self.schema(),
+            partitions,
+            self.axes.clone(),
+            &self.metrics,
+            &context,
+        );
         let metrics = self.metrics.clone();
         let stream = futures::stream::once(async move {
             let mut merged = futures::stream::select_all(inputs);
@@ -446,7 +454,7 @@ mod tests {
         assert!(exec.metrics().unwrap().spill_count().unwrap() > 0);
         assert_eq!(rows(&spilled), rows(&held));
         assert_eq!(time_positions(&spilled), time_positions(&held));
-        // The axis metadata comes back from the record of each batch.
+        // The grid of each batch comes back from its record.
         assert!(spilled.iter().all(|b| b.target() == held[0].target()));
         let axes = |b: &NdRecordBatch| {
             b.columns()

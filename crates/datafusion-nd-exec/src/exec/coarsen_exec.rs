@@ -15,7 +15,9 @@ use datafusion::physical_plan::{
 };
 use futures::StreamExt;
 use nd_arrow_array::selection::cartesian_sum;
-use nd_arrow_array::{Dimension, Dimensions, NdArrowArray, NdRecordBatch, SelectionKind};
+use nd_arrow_array::{
+    Dimension, Dimensions, NdArrowArray, NdGridAxes, NdRecordBatch, SelectionKind,
+};
 
 use super::{NdExecutionPlan, SendableNdBatchStream, execute_flat, one_child, require_nd_input};
 use crate::registry::NdNodeRegistry;
@@ -110,10 +112,7 @@ impl NdCoarsenExec {
         let old = batch.target();
         let target = Dimensions::try_new(
             old.iter()
-                .map(|dim| {
-                    Dimension::new(dim.name(), dim.size().div_ceil(self.factor(dim.name())))
-                        .with_meta(dim.meta().cloned())
-                })
+                .map(|dim| Dimension::new(dim.name(), dim.size().div_ceil(self.factor(dim.name()))))
                 .collect(),
         )?;
         let columns = batch
@@ -151,10 +150,7 @@ impl NdCoarsenExec {
         let new_dims = Dimensions::try_new(
             dims.iter()
                 .zip(&factors)
-                .map(|(dim, &f)| {
-                    Dimension::new(dim.name(), dim.size().div_ceil(f))
-                        .with_meta(dim.meta().cloned())
-                })
+                .map(|(dim, &f)| Dimension::new(dim.name(), dim.size().div_ceil(f)))
                 .collect(),
         )?;
         let blocks = blocks(dims, &new_dims, &factors);
@@ -289,6 +285,10 @@ impl ExecutionPlan for NdCoarsenExec {
 }
 
 impl NdExecutionPlan for NdCoarsenExec {
+    fn grid_axes(&self) -> Option<Arc<NdGridAxes>> {
+        self.nd_input.grid_axes()
+    }
+
     fn execute_nd(
         &self,
         partition: usize,

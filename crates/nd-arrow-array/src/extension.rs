@@ -10,15 +10,14 @@
 //! }
 //! ```
 //!
-//! The extension metadata is JSON. It holds the encoding version and the
-//! static [`AxisMeta`] of the axes, so a plan can read the metadata at plan
-//! time.
+//! The extension metadata is JSON. It holds the encoding version and, when the
+//! format knows them, the axis names of the column, so a plan can read them at
+//! plan time.
 
 use arrow_schema::extension::ExtensionType;
 use arrow_schema::{ArrowError, DataType, Fields};
 use serde::{Deserialize, Serialize};
 
-use crate::axis::{AxisMeta, AxisOrder};
 use crate::dimensions::Dimensions;
 use crate::error::Result;
 
@@ -30,52 +29,19 @@ pub const ND_ENCODING_VERSION: u32 = 1;
 pub struct NdArrayMetadata {
     #[serde(default = "default_version")]
     pub version: u32,
-    /// Metadata of the axes that have it. Other axes are absent.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub axes: Vec<AxisEntry>,
     /// The axis names of the column, outer first, when the format knows them
     /// at plan time. An empty list is a scalar column.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dims: Option<Vec<String>>,
 }
 
-/// The serialized [`AxisMeta`] of one named axis.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AxisEntry {
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub coordinate: Option<String>,
-    #[serde(default)]
-    pub order: AxisOrder,
-}
-
 impl NdArrayMetadata {
-    /// Metadata that records the axis names of `dims` and the [`AxisMeta`] of
-    /// each axis that has it.
+    /// Metadata that records the axis names of `dims`.
     pub fn from_dims(dims: &Dimensions) -> Self {
-        let axes = dims
-            .iter()
-            .filter_map(|dim| {
-                dim.meta().map(|meta| AxisEntry {
-                    name: dim.name().to_string(),
-                    coordinate: meta.coordinate_column().map(str::to_string),
-                    order: meta.order(),
-                })
-            })
-            .collect();
         Self {
             version: ND_ENCODING_VERSION,
-            axes,
             dims: Some(dims.iter().map(|d| d.name().to_string()).collect()),
         }
-    }
-
-    /// The [`AxisMeta`] recorded for the axis `name`.
-    pub fn axis_meta(&self, name: &str) -> Option<AxisMeta> {
-        self.axes
-            .iter()
-            .find(|entry| entry.name == name)
-            .map(|entry| AxisMeta::new(entry.coordinate.as_deref().map(Into::into), entry.order))
     }
 }
 
@@ -87,7 +53,6 @@ impl Default for NdArrayMetadata {
     fn default() -> Self {
         Self {
             version: ND_ENCODING_VERSION,
-            axes: Vec::new(),
             dims: None,
         }
     }
@@ -254,13 +219,12 @@ mod tests {
     }
 
     #[test]
-    fn axis_meta_round_trips_through_the_field() {
+    fn the_axes_round_trip_through_the_field() {
         use crate::dimensions::Dimension;
 
         let dims = Dimensions::try_new(vec![
-            Dimension::new("time", 2)
-                .with_meta(Some(AxisMeta::coordinate("time", AxisOrder::Ascending))),
-            Dimension::new("N_PROF", 3).with_meta(Some(AxisMeta::no_coordinate())),
+            Dimension::new("time", 2),
+            Dimension::new("N_PROF", 3),
             Dimension::new("lon", 4),
         ])
         .unwrap();
@@ -273,16 +237,6 @@ mod tests {
             .unwrap()
             .metadata()
             .clone();
-        assert_eq!(metadata.axes.len(), 2);
-        assert_eq!(
-            metadata.axis_meta("time"),
-            Some(AxisMeta::coordinate("time", AxisOrder::Ascending))
-        );
-        assert_eq!(
-            metadata.axis_meta("N_PROF"),
-            Some(AxisMeta::no_coordinate())
-        );
-        assert_eq!(metadata.axis_meta("lon"), None);
         assert_eq!(
             metadata.dims,
             Some(vec![

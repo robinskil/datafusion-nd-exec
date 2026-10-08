@@ -1,5 +1,5 @@
 //! Read three profile files with a varying outer axis, query them, and write
-//! one output grid.
+//! the result with an nd sink.
 //!
 //! Run it with `cargo run -p datafusion-nd-exec --example profiles`.
 
@@ -22,7 +22,7 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::SessionContext;
 use datafusion_nd_exec::array::encoding::{encode_nd_record_batch, logical_schema};
-use datafusion_nd_exec::array::{AxisMeta, Dimension, Dimensions, NdArrowArray, NdRecordBatch};
+use datafusion_nd_exec::array::{Dimension, Dimensions, NdArrowArray, NdRecordBatch};
 use datafusion_nd_exec::exec::{NdBroadcastExec, NdSourceExec, SendableNdBatchStream};
 use datafusion_nd_exec::sink::{NdDataSink, NdDataSinkExec};
 use datafusion_nd_exec::{NdNodeRegistry, NdSessionStateBuilderExt};
@@ -32,8 +32,8 @@ use futures::StreamExt;
 /// past each profile length as fill values (nulls).
 fn profile_file(platform: i32, lengths: &[usize], n_levels: usize) -> Result<NdRecordBatch> {
     // Profile axes have no coordinate variable.
-    let n_prof = Dimension::new("N_PROF", lengths.len()).with_meta(Some(AxisMeta::no_coordinate()));
-    let levels = Dimension::new("N_LEVELS", n_levels).with_meta(Some(AxisMeta::no_coordinate()));
+    let n_prof = Dimension::new("N_PROF", lengths.len());
+    let levels = Dimension::new("N_LEVELS", n_levels);
     let grid = Dimensions::try_new(vec![n_prof.clone(), levels])?;
 
     let pres: Float64Array = lengths
@@ -126,21 +126,22 @@ impl TableProvider for ProfileFiles {
     }
 }
 
-/// A toy grid writer: it prints the grid and the place of each chunk. A
-/// netCDF or Zarr writer writes the chunk at that place instead.
+/// A toy nd writer: it prints the grid of each chunk. With `grid`, it asks for
+/// one output grid, as a netCDF or Zarr grid writer does.
 #[derive(Debug)]
-struct PrintingGridSink {
+struct PrintingSink {
     schema: SchemaRef,
+    grid: bool,
 }
 
-impl DisplayAs for PrintingGridSink {
+impl DisplayAs for PrintingSink {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "PrintingGridSink")
+        write!(f, "PrintingSink")
     }
 }
 
 #[async_trait]
-impl NdDataSink for PrintingGridSink {
+impl NdDataSink for PrintingSink {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -150,7 +151,7 @@ impl NdDataSink for PrintingGridSink {
     }
 
     fn requires_grid(&self) -> bool {
-        true
+        self.grid
     }
 
     async fn write_all(
@@ -158,30 +159,10 @@ impl NdDataSink for PrintingGridSink {
         mut data: SendableNdBatchStream,
         _context: &Arc<TaskContext>,
     ) -> Result<u64> {
-        // `N_PROF` is the outer axis without a coordinate, so it appends.
-        // `N_LEVELS` pads to its largest size.
         let mut rows = 0;
-        let mut printed = false;
         while let Some(chunk) = data.next().await {
             let chunk = chunk?;
-            let placement = chunk.placement().expect("a grid sink gets placed batches");
-            if !printed {
-                // A writer writes the grid metadata before the first chunk.
-                println!("output grid: {}", describe(placement.grid().dims()));
-                printed = true;
-            }
-            let axes: Vec<String> = placement
-                .grid()
-                .dims()
-                .iter()
-                .zip(placement.indices())
-                .map(|(dim, positions)| {
-                    let first = positions.values().first().copied().unwrap_or(0);
-                    let last = positions.values().last().copied().unwrap_or(0);
-                    format!("{} {first}..={last}", dim.name())
-                })
-                .collect();
-            println!("write chunk at {}", axes.join(", "));
+            println!("write chunk on {}", describe(chunk.target()));
             rows += chunk.num_rows() as u64;
         }
         Ok(rows)
@@ -219,19 +200,30 @@ async fn main() -> Result<()> {
     let rows = collect(plan.clone(), ctx.task_ctx()).await?;
     println!("{}", pretty_format_batches(&rows)?);
 
-    // Write the same query result as one grid: the sink takes the nd child of
-    // the boundary at the root.
+    // Write the same query result with an nd sink: the sink takes the nd child
+    // of the boundary at the root.
     let boundary = plan
         .as_any()
         .downcast_ref::<NdBroadcastExec>()
         .expect("the plan ends in the nd region");
-    let sink = Arc::new(PrintingGridSink {
-        schema: boundary.schema(),
-    });
+    let registry = NdNodeRegistry::shared_default();
+    let sink = |grid| {
+        Arc::new(PrintingSink {
+            schema: boundary.schema(),
+            grid,
+        })
+    };
+
+    // The profile axes have no coordinates, so the scan declares no grid axes
+    // and a grid sink refuses the plan.
+    let refused = NdDataSinkExec::try_new(boundary.input().clone(), sink(true), registry.clone());
+    println!("grid sink: {}", refused.unwrap_err());
+
+    // A sink without a grid streams each chunk on its own grid.
     let write = Arc::new(NdDataSinkExec::try_new(
         boundary.input().clone(),
-        sink,
-        NdNodeRegistry::shared_default(),
+        sink(false),
+        registry,
     )?);
     println!("write plan:\n{}", displayable(write.as_ref()).indent(true));
     collect(write, ctx.task_ctx()).await?;

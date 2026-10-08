@@ -356,3 +356,87 @@ async fn a_limit_runs_below_the_broadcast() -> Result<()> {
         )
         .await
 }
+
+/// The declared grid axes of the nd child of the boundary at the root of `sql`.
+async fn root_grid_axes(sql: &str) -> Result<Option<Vec<String>>> {
+    use datafusion_nd_exec::exec::NdBroadcastExec;
+
+    let harness = harness()?;
+    let plan = harness
+        .nd_context()
+        .sql(sql)
+        .await?
+        .create_physical_plan()
+        .await?;
+    let boundary = plan
+        .as_any()
+        .downcast_ref::<NdBroadcastExec>()
+        .expect("the plan ends in the nd region");
+    let nd = NdNodeRegistry::shared_default()
+        .as_nd_plan(boundary.input())
+        .expect("an nd child");
+    Ok(nd
+        .grid_axes()
+        .map(|axes| axes.axes().iter().map(|(name, _)| name.clone()).collect()))
+}
+
+#[tokio::test]
+async fn the_grid_axes_pass_through_the_nd_region() -> Result<()> {
+    let expected = Some(vec![
+        "time".to_string(),
+        "lat".to_string(),
+        "lon".to_string(),
+    ]);
+    for sql in [
+        "SELECT lat * 2 AS lat2, sst FROM grid WHERE lon <> 15",
+        "SELECT * FROM grid UNION ALL SELECT * FROM grid",
+        "SELECT * FROM grid LIMIT 3",
+    ] {
+        assert_eq!(root_grid_axes(sql).await?, expected, "{sql}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_union_with_other_axes_has_no_grid_axes() -> Result<()> {
+    use datafusion_nd_exec::exec::NdUnionExec;
+    use datafusion_nd_exec::testing::NdMemTable;
+
+    let grid = grid_table()?.nd_scan(None, NdNodeRegistry::shared_default())?;
+    // The same data, with no declared grid axes.
+    let undeclared = NdMemTable::try_new(grid_table()?.partitions().to_vec())?;
+    let other = undeclared.nd_scan(None, NdNodeRegistry::shared_default())?;
+    let registry = NdNodeRegistry::shared_default();
+    let same = NdUnionExec::try_new(
+        vec![grid.children()[0].clone(), grid.children()[0].clone()],
+        registry.clone(),
+    )?;
+    assert!(datafusion_nd_exec::exec::NdExecutionPlan::grid_axes(&same).is_some());
+    let mixed = NdUnionExec::try_new(
+        vec![grid.children()[0].clone(), other.children()[0].clone()],
+        registry,
+    )?;
+    assert!(datafusion_nd_exec::exec::NdExecutionPlan::grid_axes(&mixed).is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_sort_order_stops_at_an_unordered_axis() -> Result<()> {
+    use datafusion_nd_exec::array::{AxisOrder, NdGridAxes};
+    use datafusion_nd_exec::testing::NdMemTable;
+
+    let axes = NdGridAxes::new([
+        ("time", AxisOrder::Descending),
+        ("lat", AxisOrder::Unordered),
+        ("lon", AxisOrder::Ascending),
+    ]);
+    let table = NdMemTable::try_new(grid_table()?.partitions().to_vec())?
+        .with_grid_axes(axes)
+        .with_ordered_chunks();
+    let scan = table.nd_scan(None, NdNodeRegistry::shared_default())?;
+    let source = scan.children()[0].clone();
+    let ordering = source.output_ordering().expect("an order on time");
+    assert_eq!(ordering.len(), 1);
+    assert_eq!(ordering[0].to_string(), "time@0 DESC");
+    Ok(())
+}

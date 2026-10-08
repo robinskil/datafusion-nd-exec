@@ -12,8 +12,8 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
-use nd_arrow_array::NdRecordBatch;
 use nd_arrow_array::encoding::{encode_nd_record_batch, encode_nd_record_batch_as, logical_schema};
+use nd_arrow_array::{NdGridAxes, NdRecordBatch};
 
 use crate::exec::{NdBroadcastExec, NdSourceExec};
 use crate::registry::NdNodeRegistry;
@@ -30,13 +30,14 @@ pub struct NdMemTable {
     encoded_schema: SchemaRef,
     partitions: Vec<Vec<NdRecordBatch>>,
     encoded: Vec<Vec<RecordBatch>>,
+    grid_axes: Option<NdGridAxes>,
     ordered_chunks: bool,
 }
 
 impl NdMemTable {
     /// A table with one list of nd batches per partition. All batches must
-    /// have the same column names and types. The first batch sets the axis
-    /// metadata of the encoded schema.
+    /// have the same column names and types. The first batch sets the axes of
+    /// each column in the encoded schema.
     pub fn try_new(partitions: Vec<Vec<NdRecordBatch>>) -> Result<Self> {
         let first =
             partitions.iter().flatten().next().ok_or_else(|| {
@@ -59,8 +60,15 @@ impl NdMemTable {
             encoded_schema,
             partitions,
             encoded,
+            grid_axes: None,
             ordered_chunks: false,
         })
+    }
+
+    /// Declare the grid axes of the scan, see [`NdSourceExec::with_grid_axes`].
+    pub fn with_grid_axes(mut self, axes: NdGridAxes) -> Self {
+        self.grid_axes = Some(axes);
+        self
     }
 
     /// Declare that each partition holds its chunks in the order of the outer
@@ -141,12 +149,14 @@ impl NdMemTable {
                 projection.cloned(),
             )?,
         };
-        let source = NdSourceExec::try_new(memory)?;
-        let source = Arc::new(if self.ordered_chunks {
-            source.with_ordered_chunks()?
-        } else {
-            source
-        });
+        let mut source = NdSourceExec::try_new(memory)?;
+        if let Some(axes) = &self.grid_axes {
+            source = source.with_grid_axes(axes.clone())?;
+        }
+        if self.ordered_chunks {
+            source = source.with_ordered_chunks()?;
+        }
+        let source = Arc::new(source);
         Ok(Arc::new(NdBroadcastExec::try_new(source, registry)?))
     }
 }

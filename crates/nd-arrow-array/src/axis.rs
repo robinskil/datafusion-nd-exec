@@ -1,11 +1,8 @@
-//! Coordinate and order metadata of an axis.
+//! The order of an axis, and the grid axes that a format declares.
 //!
-//! A grid axis such as `time` usually has a coordinate variable of the same
-//! name, and its values rise or fall. A profile axis such as `N_PROF` has no
-//! coordinate and no order. Readers detect the metadata at scan time. Plans
-//! use it to report sort order and to align grids.
-
-use std::sync::Arc;
+//! A grid axis such as `time` has a coordinate column of the same name, and
+//! its values rise or fall. A format declares the grid axes of its scan with
+//! [`NdGridAxes`]. Plans use them to report a sort order and to write grids.
 
 use arrow::array::{Array, BooleanArray};
 use arrow::compute::kernels::cmp::{gt_eq, lt_eq};
@@ -55,35 +52,40 @@ fn all_true(mask: &BooleanArray) -> bool {
     mask.null_count() == 0 && mask.true_count() == mask.len()
 }
 
-/// Optional metadata of one axis.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
-pub struct AxisMeta {
-    coordinate: Option<Arc<str>>,
-    order: AxisOrder,
+/// The grid axes of a scan, outer first, each with the order of its
+/// coordinate. A format declares them on its `NdSourceExec`. Each axis has a
+/// coordinate column with the name of the axis.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NdGridAxes {
+    axes: Vec<(String, AxisOrder)>,
 }
 
-impl AxisMeta {
-    pub fn new(coordinate: Option<Arc<str>>, order: AxisOrder) -> Self {
-        Self { coordinate, order }
+impl NdGridAxes {
+    pub fn new<S: Into<String>>(axes: impl IntoIterator<Item = (S, AxisOrder)>) -> Self {
+        Self {
+            axes: axes
+                .into_iter()
+                .map(|(name, order)| (name.into(), order))
+                .collect(),
+        }
     }
 
-    /// Metadata of an axis whose coordinate column is `coordinate`.
-    pub fn coordinate(coordinate: impl Into<Arc<str>>, order: AxisOrder) -> Self {
-        Self::new(Some(coordinate.into()), order)
+    /// The axes, outer first.
+    pub fn axes(&self) -> &[(String, AxisOrder)] {
+        &self.axes
     }
 
-    /// Metadata of an axis with no coordinate, such as a profile axis.
-    pub fn no_coordinate() -> Self {
-        Self::default()
+    /// The order of the axis `axis`, or `None` when it is not a grid axis.
+    pub fn order(&self, axis: &str) -> Option<AxisOrder> {
+        self.axes
+            .iter()
+            .find(|(name, _)| name == axis)
+            .map(|(_, order)| *order)
     }
 
-    /// The name of the coordinate column, if the axis has one.
-    pub fn coordinate_column(&self) -> Option<&str> {
-        self.coordinate.as_deref()
-    }
-
-    pub fn order(&self) -> AxisOrder {
-        self.order
+    /// The position of the axis `axis` in the declaration.
+    pub fn position(&self, axis: &str) -> Option<usize> {
+        self.axes.iter().position(|(name, _)| name == axis)
     }
 }
 
@@ -136,9 +138,20 @@ mod tests {
     }
 
     #[test]
-    fn a_profile_axis_has_no_order() {
-        let meta = AxisMeta::no_coordinate();
-        assert_eq!(meta.coordinate_column(), None);
-        assert_eq!(meta.order(), AxisOrder::Unordered);
+    fn grid_axes_give_the_order_and_position_of_each_axis() {
+        let axes = NdGridAxes::new([
+            ("time", AxisOrder::Ascending),
+            ("lat", AxisOrder::Descending),
+        ]);
+        assert_eq!(axes.order("lat"), Some(AxisOrder::Descending));
+        assert_eq!(axes.order("lon"), None);
+        assert_eq!(axes.position("lat"), Some(1));
+        assert_eq!(
+            axes,
+            NdGridAxes::new([
+                ("time", AxisOrder::Ascending),
+                ("lat", AxisOrder::Descending)
+            ])
+        );
     }
 }

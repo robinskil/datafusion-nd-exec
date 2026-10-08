@@ -15,7 +15,7 @@ use datafusion::physical_plan::{
 };
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
-use nd_arrow_array::{NdRecordBatch, SelectionKind};
+use nd_arrow_array::{NdGridAxes, NdRecordBatch, SelectionKind};
 
 use super::{NdExecutionPlan, SendableNdBatchStream, execute_flat, one_child, require_nd_input};
 use crate::registry::NdNodeRegistry;
@@ -189,6 +189,10 @@ impl ExecutionPlan for NdRepartitionExec {
 }
 
 impl NdExecutionPlan for NdRepartitionExec {
+    fn grid_axes(&self) -> Option<Arc<NdGridAxes>> {
+        self.nd_input.grid_axes()
+    }
+
     fn execute_nd(
         &self,
         partition: usize,

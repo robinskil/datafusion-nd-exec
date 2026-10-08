@@ -36,7 +36,8 @@ pub trait NdDataSink: DisplayAs + fmt::Debug + Send + Sync {
 
     /// True when the sink needs the full output grid and the place of each
     /// batch. [`NdDataSinkExec`] then reads the input through an
-    /// [`NdRegridExec`], and each batch carries its placement.
+    /// [`NdRegridExec`], and each batch carries its placement. The scan must
+    /// declare its grid axes, else the plan fails.
     fn requires_grid(&self) -> bool {
         false
     }

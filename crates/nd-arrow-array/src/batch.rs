@@ -168,7 +168,7 @@ impl NdRecordBatch {
                 .enumerate()
                 .map(|(axis, dim)| {
                     let size = kept(axis).map_or(dim.size(), |indices| indices.len());
-                    Dimension::new(dim.name(), size).with_meta(dim.meta().cloned())
+                    Dimension::new(dim.name(), size)
                 })
                 .collect(),
         )?;
@@ -195,7 +195,7 @@ impl NdRecordBatch {
                         .zip(&own)
                         .map(|(dim, indices)| {
                             let size = indices.as_ref().map_or(dim.size(), |i| i.len());
-                            Dimension::new(dim.name(), size).with_meta(dim.meta().cloned())
+                            Dimension::new(dim.name(), size)
                         })
                         .collect(),
                 )?;

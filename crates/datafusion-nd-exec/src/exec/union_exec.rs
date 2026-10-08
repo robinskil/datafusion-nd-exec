@@ -11,7 +11,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
     PlanProperties, SendableRecordBatchStream,
 };
-use nd_arrow_array::SelectionKind;
+use nd_arrow_array::{NdGridAxes, SelectionKind};
 
 use super::{NdExecutionPlan, SendableNdBatchStream, execute_flat, require_nd_input};
 use crate::registry::NdNodeRegistry;
@@ -120,6 +120,15 @@ impl ExecutionPlan for NdUnionExec {
 }
 
 impl NdExecutionPlan for NdUnionExec {
+    /// The axes of the inputs, when all inputs declare equal axes.
+    fn grid_axes(&self) -> Option<Arc<NdGridAxes>> {
+        let first = self.nd_inputs.first()?.grid_axes()?;
+        self.nd_inputs[1..]
+            .iter()
+            .all(|input| input.grid_axes().as_deref() == Some(first.as_ref()))
+            .then_some(first)
+    }
+
     fn execute_nd(
         &self,
         partition: usize,

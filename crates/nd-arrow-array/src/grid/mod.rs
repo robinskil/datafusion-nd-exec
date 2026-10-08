@@ -9,19 +9,18 @@ use arrow::array::{Array, ArrayRef, UInt64Array};
 use crate::dimensions::Dimensions;
 use crate::error::{Result, nd_err};
 
-pub use builder::{NdBatchRecord, NdGridBuilder, axis_origins};
+pub use builder::{NdBatchRecord, NdGridBuilder};
 
 /// One output grid: its axes and the coordinate values of each axis.
 #[derive(Debug, Clone)]
 pub struct NdOutputGrid {
     dims: Dimensions,
-    coordinates: Vec<Option<ArrayRef>>,
+    coordinates: Vec<ArrayRef>,
 }
 
 impl NdOutputGrid {
-    /// A grid over `dims`. `coordinates` holds one entry per axis: the values
-    /// of the axis, or `None` for an axis without a coordinate.
-    pub fn try_new(dims: Dimensions, coordinates: Vec<Option<ArrayRef>>) -> Result<Self> {
+    /// A grid over `dims`. `coordinates` holds the values of each axis.
+    pub fn try_new(dims: Dimensions, coordinates: Vec<ArrayRef>) -> Result<Self> {
         if coordinates.len() != dims.rank() {
             return nd_err!(
                 "an output grid of rank {} has {} coordinate entries",
@@ -30,9 +29,7 @@ impl NdOutputGrid {
             );
         }
         for (dim, values) in dims.iter().zip(&coordinates) {
-            if let Some(values) = values
-                && values.len() != dim.size()
-            {
+            if values.len() != dim.size() {
                 return nd_err!(
                     "the coordinate of axis '{}' has {} values, but the axis has size {}",
                     dim.name(),
@@ -48,14 +45,14 @@ impl NdOutputGrid {
         &self.dims
     }
 
-    /// One entry per axis: the coordinate values, or `None`.
-    pub fn coordinates(&self) -> &[Option<ArrayRef>] {
+    /// The coordinate values of each axis.
+    pub fn coordinates(&self) -> &[ArrayRef] {
         &self.coordinates
     }
 
     /// The coordinate values of the axis `axis`, or `None`.
     pub fn coordinate(&self, axis: &str) -> Option<&ArrayRef> {
-        self.coordinates[self.dims.position(axis)?].as_ref()
+        Some(&self.coordinates[self.dims.position(axis)?])
     }
 
     /// The number of cells of the grid.
@@ -134,7 +131,7 @@ mod tests {
     fn time_grid(size: usize) -> Arc<NdOutputGrid> {
         let dims = Dimensions::try_new(vec![Dimension::new("time", size)]).unwrap();
         let values: ArrayRef = Arc::new(Int64Array::from_iter_values(0..size as i64));
-        Arc::new(NdOutputGrid::try_new(dims, vec![Some(values)]).unwrap())
+        Arc::new(NdOutputGrid::try_new(dims, vec![values]).unwrap())
     }
 
     fn placement(size: usize, positions: Vec<u64>) -> Arc<NdPlacement> {
@@ -145,7 +142,7 @@ mod tests {
     fn a_coordinate_must_match_its_axis_size() {
         let dims = Dimensions::try_new(vec![Dimension::new("time", 3)]).unwrap();
         let values: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
-        assert!(NdOutputGrid::try_new(dims.clone(), vec![Some(values)]).is_err());
+        assert!(NdOutputGrid::try_new(dims.clone(), vec![values]).is_err());
         assert!(NdOutputGrid::try_new(dims, vec![]).is_err());
     }
 
@@ -200,7 +197,8 @@ mod tests {
                 .is_err()
         );
         let depth = Dimensions::try_new(vec![Dimension::new("depth", 4)]).unwrap();
-        let other = Arc::new(NdOutputGrid::try_new(depth, vec![None]).unwrap());
+        let depths: ArrayRef = Arc::new(Int64Array::from(vec![0, 10, 20, 30]));
+        let other = Arc::new(NdOutputGrid::try_new(depth, vec![depths]).unwrap());
         let other =
             Arc::new(NdPlacement::try_new(other, vec![UInt64Array::from(vec![0, 1])]).unwrap());
         assert!(time_batch(vec![10, 30]).with_placement(other).is_err());

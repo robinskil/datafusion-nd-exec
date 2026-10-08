@@ -5,17 +5,9 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::error::Result;
-use nd_arrow_array::{AxisMeta, AxisOrder, Dimension, Dimensions, NdArrowArray, NdRecordBatch};
+use nd_arrow_array::{AxisOrder, Dimension, Dimensions, NdArrowArray, NdGridAxes, NdRecordBatch};
 
 use super::table::NdMemTable;
-
-fn coordinate(name: &str, size: usize) -> Dimension {
-    Dimension::new(name, size).with_meta(Some(AxisMeta::coordinate(name, AxisOrder::Ascending)))
-}
-
-fn plain(name: &str, size: usize) -> Dimension {
-    Dimension::new(name, size).with_meta(Some(AxisMeta::no_coordinate()))
-}
 
 fn nd(values: ArrayRef, dims: &[&Dimension]) -> Result<NdArrowArray> {
     let dims = Dimensions::try_new(dims.iter().map(|d| (*d).clone()).collect())?;
@@ -47,11 +39,11 @@ pub fn grid_schema() -> SchemaRef {
 /// | `elev` | `lat, lon` | -100, -50, 0, 50, 100, 150 |
 /// | `source` | none | `"ship"` |
 pub fn grid_table() -> Result<NdMemTable> {
-    let lat = coordinate("lat", 3);
-    let lon = coordinate("lon", 2);
+    let lat = Dimension::new("lat", 3);
+    let lon = Dimension::new("lon", 2);
     let mut partitions = Vec::new();
     for chunk in 0..2i64 {
-        let time = coordinate("time", 2);
+        let time = Dimension::new("time", 2);
         let t0 = chunk * 2;
         let sst: Float64Array = (0..12)
             .map(|i| {
@@ -85,7 +77,14 @@ pub fn grid_table() -> Result<NdMemTable> {
             target,
         )?]);
     }
-    Ok(NdMemTable::try_new(partitions)?.with_ordered_chunks())
+    let axes = NdGridAxes::new([
+        ("time", AxisOrder::Ascending),
+        ("lat", AxisOrder::Ascending),
+        ("lon", AxisOrder::Ascending),
+    ]);
+    Ok(NdMemTable::try_new(partitions)?
+        .with_grid_axes(axes)
+        .with_ordered_chunks())
 }
 
 /// The schema of [`profile_table`].
@@ -108,8 +107,8 @@ pub fn profile_schema() -> SchemaRef {
 /// nulls in `PRES` and `TEMP`.
 pub fn profile_table() -> Result<NdMemTable> {
     let file = |platforms: Vec<i32>, lats: Vec<f64>, lengths: Vec<usize>, levels: usize| {
-        let n_prof = plain("N_PROF", platforms.len());
-        let n_levels = plain("N_LEVELS", levels);
+        let n_prof = Dimension::new("N_PROF", platforms.len());
+        let n_levels = Dimension::new("N_LEVELS", levels);
         let mut pres = Vec::new();
         let mut temp = Vec::new();
         for (p, &len) in lengths.iter().enumerate() {

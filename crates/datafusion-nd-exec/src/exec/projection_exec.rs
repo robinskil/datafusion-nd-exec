@@ -29,7 +29,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use futures::StreamExt;
-use nd_arrow_array::SelectionKind;
+use nd_arrow_array::{NdGridAxes, SelectionKind};
 
 use nd_arrow_array::batch::NdRecordBatch;
 
@@ -231,6 +231,10 @@ impl ExecutionPlan for NdProjectionExec {
 }
 
 impl NdExecutionPlan for NdProjectionExec {
+    fn grid_axes(&self) -> Option<Arc<NdGridAxes>> {
+        self.nd_input.grid_axes()
+    }
+
     /// A projection passes the selection of its child through.
     fn max_output_selection(&self) -> SelectionKind {
         self.nd_input.max_output_selection()

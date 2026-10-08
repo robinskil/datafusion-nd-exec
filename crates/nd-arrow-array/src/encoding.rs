@@ -76,8 +76,7 @@ pub fn nd_encoded_field_of(field: &Field) -> Field {
 }
 
 /// Like [`nd_encoded_field_of`], but the extension metadata also records the
-/// axis names of `dims` and the [`AxisMeta`](crate::AxisMeta) of each axis
-/// that has it. A format that knows the axes of each column at plan time uses
+/// axis names of `dims`. A format that knows the axes of each column at plan time uses
 /// this, so the plan can derive the grid and its sort order.
 pub fn nd_encoded_field_with_dims(field: &Field, dims: &Dimensions) -> Field {
     let metadata = NdArrayMetadata::from_dims(dims);
@@ -280,7 +279,7 @@ pub fn logical_schema(encoded: &Schema) -> Result<SchemaRef> {
                 field.is_nullable(),
             );
             let metadata = nd_field_metadata(field)
-                .filter(|m| m.dims.is_some() || !m.axes.is_empty())
+                .filter(|m| m.dims.is_some())
                 .and_then(|m| serde_json::to_string(&m).ok())
                 .or_else(|| field.metadata().get(ND_METADATA_KEY).cloned());
             Ok(match metadata {
@@ -304,11 +303,8 @@ pub fn nd_logical_metadata(field: &Field) -> Option<NdArrayMetadata> {
 }
 
 /// The coordinate column of each axis of a logical schema, as `(axis, column)`
-/// in the order of first use.
-///
-/// An axis entry names the column, or has no column and turns the rule off.
-/// Without an entry, the field with the name of the axis is the coordinate.
-/// The column counts only when it lies on that axis alone.
+/// in the order of first use. The coordinate of an axis is the field with the
+/// name of the axis, on that axis alone.
 pub fn schema_coordinates(schema: &Schema) -> Vec<(String, String)> {
     let metadata: Vec<(&str, NdArrayMetadata)> = schema
         .fields()
@@ -328,17 +324,8 @@ pub fn schema_coordinates(schema: &Schema) -> Vec<(String, String)> {
             .and_then(|(_, m)| m.dims.clone())
     };
     axes.into_iter()
-        .filter_map(|axis| {
-            let entry = metadata
-                .iter()
-                .flat_map(|(_, m)| &m.axes)
-                .find(|e| &e.name == axis);
-            let column = match entry {
-                Some(entry) => entry.coordinate.clone()?,
-                None => axis.clone(),
-            };
-            (dims_of(&column) == Some(vec![axis.clone()])).then(|| (axis.clone(), column))
-        })
+        .filter(|axis| dims_of(axis) == Some(vec![(*axis).clone()]))
+        .map(|axis| (axis.clone(), axis.clone()))
         .collect()
 }
 
@@ -368,17 +355,7 @@ pub fn decode_nd_record_batch_row(batch: &RecordBatch, row: usize) -> Result<NdR
     let columns = batch
         .columns()
         .iter()
-        .zip(batch.schema_ref().fields())
-        .map(|(column, field)| {
-            let array = decode_nd_array(column, row)?;
-            match nd_field_metadata(field) {
-                Some(metadata) if !metadata.axes.is_empty() => {
-                    let dims = array.dims().with_axis_meta(|name| metadata.axis_meta(name));
-                    NdArrowArray::try_new(array.values().clone(), dims)
-                }
-                _ => Ok(array),
-            }
-        })
+        .map(|column| decode_nd_array(column, row))
         .collect::<Result<Vec<_>>>()?;
 
     let target = infer_target(&columns)?;
@@ -492,41 +469,6 @@ mod tests {
             encoded.metadata().get("crs").map(String::as_str),
             Some("EPSG:4326")
         );
-    }
-
-    #[test]
-    fn axis_meta_survives_the_record_batch_encoding() {
-        use crate::axis::{AxisMeta, AxisOrder};
-
-        let time_dim = Dimension::new("time", 2)
-            .with_meta(Some(AxisMeta::coordinate("time", AxisOrder::Descending)));
-        let lat_dim = Dimension::new("lat", 3);
-        let grid = Dimensions::try_new(vec![time_dim.clone(), lat_dim.clone()]).unwrap();
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("time", DataType::Int32, true),
-            Field::new("sst", DataType::Float64, true),
-        ]));
-        let time = NdArrowArray::try_new(
-            Arc::new(Int32Array::from(vec![8, 7])),
-            Dimensions::try_new(vec![time_dim]).unwrap(),
-        )
-        .unwrap();
-        let sst = NdArrowArray::try_new(
-            Arc::new(Float64Array::from(vec![0.0, 0.1, 0.2, 1.0, 1.1, 1.2])),
-            grid.clone(),
-        )
-        .unwrap();
-        let nd = NdRecordBatch::try_new(schema, vec![time, sst], grid.clone()).unwrap();
-
-        let decoded = decode_nd_record_batch_row(&encode_nd_record_batch(&nd).unwrap(), 0).unwrap();
-        assert_eq!(decoded.target(), &grid);
-        assert_eq!(decoded.target().get(0).order(), AxisOrder::Descending);
-        assert_eq!(
-            decoded.column(0).dims().get(0).order(),
-            AxisOrder::Descending
-        );
-        assert_eq!(decoded.target().get(1).meta(), None);
     }
 
     #[test]
@@ -774,19 +716,13 @@ mod tests {
     }
 
     /// A logical schema with one field per `(name, axes)`, all `Float64`.
-    fn planned(
-        columns: &[(&str, &[&str])],
-        meta: impl Fn(&str) -> Option<crate::AxisMeta>,
-    ) -> SchemaRef {
+    fn planned(columns: &[(&str, &[&str])]) -> SchemaRef {
         let encoded: Vec<Field> = columns
             .iter()
             .map(|(name, axes)| {
-                let dims = Dimensions::try_new(
-                    axes.iter()
-                        .map(|a| Dimension::new(*a, 1).with_meta(meta(a)))
-                        .collect(),
-                )
-                .unwrap();
+                let dims =
+                    Dimensions::try_new(axes.iter().map(|a| Dimension::new(*a, 1)).collect())
+                        .unwrap();
                 nd_encoded_field_with_dims(&Field::new(*name, DataType::Float64, true), &dims)
             })
             .collect();
@@ -795,7 +731,7 @@ mod tests {
 
     #[test]
     fn the_logical_schema_carries_the_axes_of_each_column() {
-        let schema = planned(&[("sst", &["time", "lat"])], |_| None);
+        let schema = planned(&[("sst", &["time", "lat"])]);
         let metadata = nd_logical_metadata(schema.field(0)).unwrap();
         assert_eq!(
             metadata.dims,
@@ -814,39 +750,16 @@ mod tests {
 
     #[test]
     fn a_schema_names_its_coordinates_by_convention() {
-        let schema = planned(
-            &[
-                ("time", &["time"]),
-                ("lat", &["lat"]),
-                ("sst", &["time", "lat", "lon"]),
-                ("lon", &["lon", "time"]),
-            ],
-            |_| None,
-        );
+        let schema = planned(&[
+            ("time", &["time"]),
+            ("lat", &["lat"]),
+            ("sst", &["time", "lat", "lon"]),
+            ("lon", &["lon", "time"]),
+        ]);
         let expected = vec![
             ("time".to_string(), "time".to_string()),
             ("lat".to_string(), "lat".to_string()),
         ];
-        assert_eq!(schema_coordinates(&schema), expected);
-    }
-
-    #[test]
-    fn axis_entries_override_the_convention_in_a_schema() {
-        let schema = planned(
-            &[
-                ("t", &["time"]),
-                ("time", &["time"]),
-                ("N_PROF", &["N_PROF"]),
-            ],
-            |axis| match axis {
-                "time" => Some(crate::AxisMeta::coordinate(
-                    "t",
-                    crate::AxisOrder::Ascending,
-                )),
-                _ => Some(crate::AxisMeta::no_coordinate()),
-            },
-        );
-        let expected = vec![("time".to_string(), "t".to_string())];
         assert_eq!(schema_coordinates(&schema), expected);
     }
 }

@@ -11,6 +11,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use futures::StreamExt;
+use nd_arrow_array::NdGridAxes;
 
 use super::{NdExecutionPlan, SendableNdBatchStream, execute_flat, one_child, require_nd_input};
 use crate::registry::NdNodeRegistry;
@@ -114,6 +115,10 @@ impl ExecutionPlan for NdLimitExec {
 }
 
 impl NdExecutionPlan for NdLimitExec {
+    fn grid_axes(&self) -> Option<Arc<NdGridAxes>> {
+        self.nd_input.grid_axes()
+    }
+
     fn execute_nd(
         &self,
         partition: usize,

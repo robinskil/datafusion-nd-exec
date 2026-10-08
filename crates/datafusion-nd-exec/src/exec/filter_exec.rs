@@ -14,6 +14,7 @@
 //! gather per column, so the filtered-out cross-product is never materialized —
 //! and every operator above the broadcast sees only the surviving rows.
 
+use nd_arrow_array::NdGridAxes;
 use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
@@ -275,6 +276,10 @@ impl ExecutionPlan for NdFilterExec {
 }
 
 impl NdExecutionPlan for NdFilterExec {
+    fn grid_axes(&self) -> Option<Arc<NdGridAxes>> {
+        self.nd_input.grid_axes()
+    }
+
     fn execute_nd(
         &self,
         partition: usize,

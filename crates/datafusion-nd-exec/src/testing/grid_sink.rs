@@ -108,21 +108,14 @@ fn build_grid(
         .iter()
         .enumerate()
         .map(|(index, field)| {
-            // A coordinate comes from the grid, so each step has a value.
-            let coordinate = target
-                .iter()
-                .zip(grid.coordinates())
-                .find_map(|(dim, values)| {
-                    let values = values.as_ref()?;
-                    (dim.meta()?.coordinate_column()? == field.name())
-                        .then(|| (dim.clone(), values.clone()))
-                });
-            match coordinate {
-                Some((dim, values)) => Ok(NdArrowArray::try_new(
-                    values,
-                    Dimensions::try_new(vec![dim])?,
+            // A coordinate column has the name of its axis, and its values come
+            // from the grid, so each step has a value.
+            match (target.position(field.name()), grid.coordinate(field.name())) {
+                (Some(axis), Some(values)) => Ok(NdArrowArray::try_new(
+                    values.clone(),
+                    Dimensions::try_new(vec![target.get(axis).clone()])?,
                 )?),
-                None => build_column(index, &target, batches),
+                _ => build_column(index, &target, batches),
             }
         })
         .collect::<Result<Vec<_>>>()?;
@@ -203,15 +196,14 @@ fn build_column(
 mod tests {
     use arrow::array::{AsArray, Float64Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Float64Type, Schema};
-    use nd_arrow_array::{AxisMeta, AxisOrder, NdBatchRecord, NdGridBuilder};
+    use nd_arrow_array::{AxisOrder, NdBatchRecord, NdGridAxes, NdGridBuilder};
 
     use super::*;
 
     /// A chunk on `time` with a `sst` column, or a scalar null `sst` for a file
     /// that lacks the column.
     fn chunk(times: Vec<i64>, sst: Option<Vec<f64>>) -> NdRecordBatch {
-        let time = Dimension::new("time", times.len())
-            .with_meta(Some(AxisMeta::coordinate("time", AxisOrder::Ascending)));
+        let time = Dimension::new("time", times.len());
         let dims = Dimensions::try_new(vec![time]).unwrap();
         let schema = Arc::new(Schema::new(vec![
             Field::new("time", DataType::Int64, true),
@@ -237,9 +229,12 @@ mod tests {
             chunk(vec![102], Some(vec![1.5])),
         ];
         let schema = chunks[0].schema().clone();
-        let mut builder = NdGridBuilder::new();
+        let axes = NdGridAxes::new([("time", AxisOrder::Ascending)]);
+        let mut builder = NdGridBuilder::new(Arc::new(axes));
         for (number, batch) in chunks.iter().enumerate() {
-            builder.add(NdBatchRecord::of(0, number, batch));
+            builder
+                .add(NdBatchRecord::of(0, number, batch).unwrap())
+                .unwrap();
         }
         let placed: Vec<Result<NdRecordBatch>> = chunks
             .into_iter()
